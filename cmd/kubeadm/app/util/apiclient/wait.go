@@ -17,6 +17,8 @@ limitations under the License.
 package apiclient
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,12 +27,13 @@ import (
 	"k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	netutil "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
-// Waiter is an interface for waiting for criterias in Kubernetes to happen
+// Waiter is an interface for waiting for criteria in Kubernetes to happen
 type Waiter interface {
 	// WaitForAPI waits for the API Server's /healthz endpoint to become "ok"
 	WaitForAPI() error
@@ -38,6 +41,15 @@ type Waiter interface {
 	WaitForPodsWithLabel(kvLabel string) error
 	// WaitForPodToDisappear waits for the given Pod in the kube-system namespace to be deleted
 	WaitForPodToDisappear(staticPodName string) error
+	// WaitForStaticPodSingleHash fetches sha256 hash for the control plane static pod
+	WaitForStaticPodSingleHash(nodeName string, component string) (string, error)
+	// WaitForStaticPodControlPlaneHashes fetches sha256 hashes for the control plane static pods
+	WaitForStaticPodControlPlaneHashes(nodeName string) (map[string]string, error)
+	// WaitForStaticPodControlPlaneHashChange waits for the given static pod component's static pod hash to get updated.
+	// By doing that we can be sure that the kubelet has restarted the given Static Pod
+	WaitForStaticPodControlPlaneHashChange(nodeName, component, previousHash string) error
+	// WaitForHealthyKubelet blocks until the kubelet /healthz endpoint returns 'ok'
+	WaitForHealthyKubelet(initalTimeout time.Duration, healthzEndpoint string) error
 	// SetTimeout adjusts the timeout to the specified duration
 	SetTimeout(timeout time.Duration)
 }
@@ -110,11 +122,32 @@ func (w *KubeWaiter) WaitForPodToDisappear(podName string) error {
 	return wait.PollImmediate(constants.APICallRetryInterval, w.timeout, func() (bool, error) {
 		_, err := w.client.CoreV1().Pods(metav1.NamespaceSystem).Get(podName, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
-			fmt.Printf("[apiclient] The Static Pod %q is now removed\n", podName)
+			fmt.Printf("[apiclient] The old Pod %q is now removed (which is desired)\n", podName)
 			return true, nil
 		}
 		return false, nil
 	})
+}
+
+// WaitForHealthyKubelet blocks until the kubelet /healthz endpoint returns 'ok'
+func (w *KubeWaiter) WaitForHealthyKubelet(initalTimeout time.Duration, healthzEndpoint string) error {
+	time.Sleep(initalTimeout)
+	return TryRunCommand(func() error {
+		client := &http.Client{Transport: netutil.SetOldTransportDefaults(&http.Transport{})}
+		resp, err := client.Get(healthzEndpoint)
+		if err != nil {
+			fmt.Printf("[kubelet-check] It seems like the kubelet isn't running or healthy.\n")
+			fmt.Printf("[kubelet-check] The HTTP call equal to 'curl -sSL %s' failed with error: %v.\n", healthzEndpoint, err)
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("[kubelet-check] It seems like the kubelet isn't running or healthy.")
+			fmt.Printf("[kubelet-check] The HTTP call equal to 'curl -sSL %s' returned HTTP code %d\n", healthzEndpoint, resp.StatusCode)
+			return fmt.Errorf("the kubelet healthz endpoint is unhealthy")
+		}
+		return nil
+	}, 5) // a failureThreshold of five means waiting for a total of 155 seconds
 }
 
 // SetTimeout adjusts the timeout to the specified duration
@@ -122,21 +155,108 @@ func (w *KubeWaiter) SetTimeout(timeout time.Duration) {
 	w.timeout = timeout
 }
 
-// TryRunCommand runs a function a maximum of failureThreshold times, and retries on error. If failureThreshold is hit; the last error is returned
-func TryRunCommand(f func() error, failureThreshold uint8) error {
-	var numFailures uint8
-	return wait.PollImmediate(5*time.Second, 20*time.Minute, func() (bool, error) {
-		err := f()
-		if err != nil {
-			numFailures++
-			// If we've reached the maximum amount of failures, error out
-			if numFailures == failureThreshold {
-				return false, err
+// WaitForStaticPodControlPlaneHashes blocks until it timeouts or gets a hash map for all components and their Static Pods
+func (w *KubeWaiter) WaitForStaticPodControlPlaneHashes(nodeName string) (map[string]string, error) {
+
+	componentHash := ""
+	var err error
+	mirrorPodHashes := map[string]string{}
+	for _, component := range constants.MasterComponents {
+		err = wait.PollImmediate(constants.APICallRetryInterval, w.timeout, func() (bool, error) {
+			componentHash, err = getStaticPodSingleHash(w.client, nodeName, component)
+			if err != nil {
+				return false, nil
 			}
-			// Retry
+			return true, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		mirrorPodHashes[component] = componentHash
+	}
+
+	return mirrorPodHashes, nil
+}
+
+// WaitForStaticPodSingleHash blocks until it timeouts or gets a hash for a single component and its Static Pod
+func (w *KubeWaiter) WaitForStaticPodSingleHash(nodeName string, component string) (string, error) {
+
+	componentPodHash := ""
+	var err error
+	err = wait.PollImmediate(constants.APICallRetryInterval, w.timeout, func() (bool, error) {
+		componentPodHash, err = getStaticPodSingleHash(w.client, nodeName, component)
+		if err != nil {
 			return false, nil
 		}
-		// The last f() call was a success!
+		return true, nil
+	})
+
+	return componentPodHash, err
+}
+
+// WaitForStaticPodControlPlaneHashChange blocks until it timeouts or notices that the Mirror Pod (for the Static Pod, respectively) has changed
+// This implicitly means this function blocks until the kubelet has restarted the Static Pod in question
+func (w *KubeWaiter) WaitForStaticPodControlPlaneHashChange(nodeName, component, previousHash string) error {
+	return wait.PollImmediate(constants.APICallRetryInterval, w.timeout, func() (bool, error) {
+
+		hashes, err := getStaticPodControlPlaneHashes(w.client, nodeName)
+		if err != nil {
+			return false, nil
+		}
+		// We should continue polling until the UID changes
+		if hashes[component] == previousHash {
+			return false, nil
+		}
+
+		return true, nil
+	})
+}
+
+// getStaticPodControlPlaneHashes computes hashes for all the control plane's Static Pod resources
+func getStaticPodControlPlaneHashes(client clientset.Interface, nodeName string) (map[string]string, error) {
+
+	mirrorPodHashes := map[string]string{}
+	for _, component := range constants.MasterComponents {
+		hash, err := getStaticPodSingleHash(client, nodeName, component)
+		if err != nil {
+			return nil, err
+		}
+		mirrorPodHashes[component] = hash
+	}
+	return mirrorPodHashes, nil
+}
+
+// getStaticSinglePodHash computes hashes for a single Static Pod resource
+func getStaticPodSingleHash(client clientset.Interface, nodeName string, component string) (string, error) {
+
+	staticPodName := fmt.Sprintf("%s-%s", component, nodeName)
+	staticPod, err := client.CoreV1().Pods(metav1.NamespaceSystem).Get(staticPodName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	podBytes, err := json.Marshal(staticPod)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%x", sha256.Sum256(podBytes)), nil
+}
+
+// TryRunCommand runs a function a maximum of failureThreshold times, and retries on error. If failureThreshold is hit; the last error is returned
+func TryRunCommand(f func() error, failureThreshold int) error {
+	backoff := wait.Backoff{
+		Duration: 5 * time.Second,
+		Factor:   2, // double the timeout for every failure
+		Steps:    failureThreshold,
+	}
+	return wait.ExponentialBackoff(backoff, func() (bool, error) {
+		err := f()
+		if err != nil {
+			// Retry until the timeout
+			return false, nil
+		}
+		// The last f() call was a success, return cleanly
 		return true, nil
 	})
 }

@@ -88,7 +88,8 @@ func NewCmdCanI(f cmdutil.Factory, out, err io.Writer) *cobra.Command {
 	}
 
 	cmd := &cobra.Command{
-		Use:     "can-i VERB [TYPE | TYPE/NAME | NONRESOURCEURL]",
+		Use: "can-i VERB [TYPE | TYPE/NAME | NONRESOURCEURL]",
+		DisableFlagsInUseLine: true,
 		Short:   "Check whether an action is allowed",
 		Long:    canILong,
 		Example: canIExample,
@@ -109,7 +110,7 @@ func NewCmdCanI(f cmdutil.Factory, out, err io.Writer) *cobra.Command {
 
 	cmd.Flags().BoolVar(&o.AllNamespaces, "all-namespaces", o.AllNamespaces, "If true, check the specified action in all namespaces.")
 	cmd.Flags().BoolVarP(&o.Quiet, "quiet", "q", o.Quiet, "If true, suppress output and just return the exit code.")
-	cmd.Flags().StringVar(&o.Subresource, "subresource", "", "SubResource such as pod/log or deployment/scale")
+	cmd.Flags().StringVar(&o.Subresource, "subresource", o.Subresource, "SubResource such as pod/log or deployment/scale")
 	return cmd
 }
 
@@ -156,10 +157,10 @@ func (o *CanIOptions) Complete(f cmdutil.Factory, args []string) error {
 func (o *CanIOptions) Validate() error {
 	if o.NonResourceURL != "" {
 		if o.Subresource != "" {
-			return fmt.Errorf("--subresource can not be used with nonResourceURL")
+			return fmt.Errorf("--subresource can not be used with NonResourceURL")
 		}
 		if o.Resource != (schema.GroupVersionResource{}) || o.ResourceName != "" {
-			return fmt.Errorf("nonResourceURL and Resource can not specified together")
+			return fmt.Errorf("NonResourceURL and ResourceName can not specified together")
 		}
 	}
 	return nil

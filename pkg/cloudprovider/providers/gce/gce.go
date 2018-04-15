@@ -17,10 +17,11 @@ limitations under the License.
 package gce
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,23 +30,30 @@ import (
 	gcfg "gopkg.in/gcfg.v1"
 
 	"cloud.google.com/go/compute/metadata"
-
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
-	"k8s.io/apiserver/pkg/storage/value/encrypt/envelope"
-	"k8s.io/client-go/util/flowcontrol"
-	"k8s.io/kubernetes/pkg/cloudprovider"
-	"k8s.io/kubernetes/pkg/controller"
-
 	"github.com/golang/glog"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	cloudkms "google.golang.org/api/cloudkms/v1"
 	computealpha "google.golang.org/api/compute/v0.alpha"
 	computebeta "google.golang.org/api/compute/v0.beta"
 	compute "google.golang.org/api/compute/v1"
 	container "google.golang.org/api/container/v1"
+
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/informers"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/flowcontrol"
+
+	"k8s.io/kubernetes/pkg/cloudprovider"
+	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud"
+	"k8s.io/kubernetes/pkg/controller"
+	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
+	"k8s.io/kubernetes/pkg/version"
 )
 
 const (
@@ -80,7 +88,8 @@ const (
 	// Defaults to 5 * 2 = 10 seconds before the LB will steer traffic away
 	gceHcUnhealthyThreshold = int64(5)
 
-	gceComputeAPIEndpoint = "https://www.googleapis.com/compute/v1/"
+	gceComputeAPIEndpoint     = "https://www.googleapis.com/compute/v1/"
+	gceComputeAPIEndpointBeta = "https://www.googleapis.com/compute/beta/"
 )
 
 // gceObject is an abstraction of all GCE API object in go client
@@ -94,17 +103,24 @@ type GCECloud struct {
 	// for the cloudprovider to start watching the configmap.
 	ClusterID ClusterID
 
-	service                  *compute.Service
-	serviceBeta              *computebeta.Service
-	serviceAlpha             *computealpha.Service
-	containerService         *container.Service
-	cloudkmsService          *cloudkms.Service
-	clientBuilder            controller.ControllerClientBuilder
-	projectID                string
-	region                   string
-	localZone                string   // The zone in which we are running
-	managedZones             []string // List of zones we are spanning (for multi-AZ clusters, primarily when running on master)
+	service          *compute.Service
+	serviceBeta      *computebeta.Service
+	serviceAlpha     *computealpha.Service
+	containerService *container.Service
+	tpuService       *tpuService
+	client           clientset.Interface
+	clientBuilder    controller.ControllerClientBuilder
+	eventBroadcaster record.EventBroadcaster
+	eventRecorder    record.EventRecorder
+	projectID        string
+	region           string
+	localZone        string // The zone in which we are running
+	// managedZones will be set to the 1 zone if running a single zone cluster
+	// it will be set to ALL zones in region for any multi-zone cluster
+	// Use GetAllCurrentZones to get only zones that contain nodes
+	managedZones             []string
 	networkURL               string
+	isLegacyNetwork          bool
 	subnetworkURL            string
 	secondaryRangeName       string
 	networkProjectID         string
@@ -116,7 +132,13 @@ type GCECloud struct {
 	nodeInstancePrefix       string      // If non-"", an advisory prefix for all nodes in the cluster
 	useMetadataServer        bool
 	operationPollRateLimiter flowcontrol.RateLimiter
-	manager                  ServiceManager
+	manager                  diskServiceManager
+	// Lock for access to nodeZones
+	nodeZonesLock sync.Mutex
+	// nodeZones is a mapping from Zone to a sets.String of Node's names in the Zone
+	// it is updated by the nodeInformer
+	nodeZones          map[string]sets.String
+	nodeInformerSynced cache.InformerSynced
 	// sharedResourceLock is used to serialize GCE operations that may mutate shared state to
 	// prevent inconsistencies. For example, load balancers manipulation methods will take the
 	// lock to prevent shared resources from being prematurely deleted while the operation is
@@ -127,46 +149,15 @@ type GCECloud struct {
 	// the corresponding api is enabled.
 	// If not enabled, it should return error.
 	AlphaFeatureGate *AlphaFeatureGate
+
+	// New code generated interface to the GCE compute library.
+	c cloud.Cloud
+
+	// Keep a reference of this around so we can inject a new cloud.RateLimiter implementation.
+	s *cloud.Service
 }
 
-type ServiceManager interface {
-	// Creates a new persistent disk on GCE with the given disk spec.
-	CreateDisk(
-		name string,
-		sizeGb int64,
-		tagsStr string,
-		diskTypeURI string,
-		zone string) (gceObject, error)
-
-	// Attach a persistent disk on GCE with the given disk spec to the specified instance.
-	AttachDisk(diskName string,
-		diskKind string,
-		diskZone string,
-		readWrite string,
-		source string,
-		diskType string,
-		instanceName string) (gceObject, error)
-
-	// Detach a persistent disk on GCE with the given disk spec from the specified instance.
-	DetachDisk(
-		instanceZone string,
-		instanceName string,
-		devicePath string) (gceObject, error)
-
-	// Gets the persistent disk from GCE with the given diskName.
-	GetDisk(project string, zone string, diskName string) (*GCEDisk, error)
-
-	// Deletes the persistent disk from GCE with the given diskName.
-	DeleteDisk(project string, zone string, disk string) (gceObject, error)
-
-	// Waits until GCE reports the given operation in the given zone as done.
-	WaitForZoneOp(op gceObject, zone string, mc *metricContext) error
-}
-
-type GCEServiceManager struct {
-	gce *GCECloud
-}
-
+// TODO: replace gcfg with json
 type ConfigGlobal struct {
 	TokenURL  string `gcfg:"token-url"`
 	TokenBody string `gcfg:"token-body"`
@@ -191,7 +182,7 @@ type ConfigGlobal struct {
 	// located in (i.e. where the controller will be running). If this is
 	// blank, then the local zone will be discovered via the metadata server.
 	LocalZone string `gcfg:"local-zone"`
-	// Possible values: List of api names separated by comma. Default to none.
+	// Default to none.
 	// For example: MyFeatureFlag
 	AlphaFeatures []string `gcfg:"alpha-features"`
 }
@@ -221,10 +212,6 @@ type CloudConfig struct {
 	AlphaFeatureGate   *AlphaFeatureGate
 }
 
-// kmsPluginRegisterOnce prevents the cloudprovider from registering its KMS plugin
-// more than once in the KMS plugin registry.
-var kmsPluginRegisterOnce sync.Once
-
 func init() {
 	cloudprovider.RegisterCloudProvider(
 		ProviderName,
@@ -233,14 +220,22 @@ func init() {
 		})
 }
 
-// Raw access to the underlying GCE service, probably should only be used for e2e tests
-func (g *GCECloud) GetComputeService() *compute.Service {
-	return g.service
+// Services is the set of all versions of the compute service.
+type Services struct {
+	// GA, Alpha, Beta versions of the compute API.
+	GA    *compute.Service
+	Alpha *computealpha.Service
+	Beta  *computebeta.Service
 }
 
-// Raw access to the cloudkmsService of GCE cloud. Required for encryption of etcd using Google KMS.
-func (g *GCECloud) GetKMSService() *cloudkms.Service {
-	return g.cloudkmsService
+// ComputeServices returns access to the internal compute services.
+func (g *GCECloud) ComputeServices() *Services {
+	return &Services{g.service, g.serviceAlpha, g.serviceBeta}
+}
+
+// Compute returns the generated stubs for the compute API.
+func (g *GCECloud) Compute() cloud.Cloud {
+	return g.c
 }
 
 // newGCECloud creates a new instance of GCECloud.
@@ -261,7 +256,6 @@ func newGCECloud(config io.Reader) (gceCloud *GCECloud, err error) {
 		return nil, err
 	}
 	return CreateGCECloud(cloudConfig)
-
 }
 
 func readConfig(reader io.Reader) (*ConfigFile, error) {
@@ -278,7 +272,7 @@ func generateCloudConfig(configFile *ConfigFile) (cloudConfig *CloudConfig, err 
 	// By default, fetch token from GCE metadata server
 	cloudConfig.TokenSource = google.ComputeTokenSource("")
 	cloudConfig.UseMetadataServer = true
-
+	cloudConfig.AlphaFeatureGate = NewAlphaFeatureGate([]string{})
 	if configFile != nil {
 		if configFile.Global.ApiEndpoint != "" {
 			cloudConfig.ApiEndpoint = configFile.Global.ApiEndpoint
@@ -296,12 +290,7 @@ func generateCloudConfig(configFile *ConfigFile) (cloudConfig *CloudConfig, err 
 
 		cloudConfig.NodeTags = configFile.Global.NodeTags
 		cloudConfig.NodeInstancePrefix = configFile.Global.NodeInstancePrefix
-
-		alphaFeatureGate, err := NewAlphaFeatureGate(configFile.Global.AlphaFeatures)
-		if err != nil {
-			glog.Errorf("Encountered error for creating alpha feature gate: %v", err)
-		}
-		cloudConfig.AlphaFeatureGate = alphaFeatureGate
+		cloudConfig.AlphaFeatureGate = NewAlphaFeatureGate(configFile.Global.AlphaFeatures)
 	}
 
 	// retrieve projectID and zone
@@ -372,6 +361,14 @@ func generateCloudConfig(configFile *ConfigFile) (cloudConfig *CloudConfig, err 
 // If no tokenSource is specified, uses oauth2.DefaultTokenSource.
 // If managedZones is nil / empty all zones in the region will be managed.
 func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
+	// Remove any pre-release version and build metadata from the semver,
+	// leaving only the MAJOR.MINOR.PATCH portion. See http://semver.org/.
+	version := strings.TrimLeft(strings.Split(strings.Split(version.Get().GitVersion, "-")[0], "+")[0], "v")
+
+	// Create a user-agent header append string to supply to the Google API
+	// clients, to identify Kubernetes as the origin of the GCP API calls.
+	userAgent := fmt.Sprintf("Kubernetes/%s (%s %s)", version, runtime.GOOS, runtime.GOARCH)
+
 	// Use ProjectID for NetworkProjectID, if it wasn't explicitly set.
 	if config.NetworkProjectID == "" {
 		config.NetworkProjectID = config.ProjectID
@@ -385,6 +382,7 @@ func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
 	if err != nil {
 		return nil, err
 	}
+	service.UserAgent = userAgent
 
 	client, err = newOauthClient(config.TokenSource)
 	if err != nil {
@@ -394,6 +392,7 @@ func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
 	if err != nil {
 		return nil, err
 	}
+	serviceBeta.UserAgent = userAgent
 
 	client, err = newOauthClient(config.TokenSource)
 	if err != nil {
@@ -403,6 +402,7 @@ func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
 	if err != nil {
 		return nil, err
 	}
+	serviceAlpha.UserAgent = userAgent
 
 	// Expect override api endpoint to always be v1 api and follows the same pattern as prod.
 	// Generate alpha and beta api endpoints based on override v1 api endpoint.
@@ -418,39 +418,60 @@ func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
 	if err != nil {
 		return nil, err
 	}
+	containerService.UserAgent = userAgent
 
-	cloudkmsService, err := cloudkms.New(client)
+	tpuService, err := newTPUService(client)
 	if err != nil {
 		return nil, err
 	}
 
 	// ProjectID and.NetworkProjectID may be project number or name.
 	projID, netProjID := tryConvertToProjectNames(config.ProjectID, config.NetworkProjectID, service)
-
 	onXPN := projID != netProjID
 
 	var networkURL string
 	var subnetURL string
+	var isLegacyNetwork bool
 
-	if config.NetworkName == "" && config.NetworkURL == "" {
-		// TODO: Stop using this call and return an error.
-		// This function returns the first network in a list of networks for a project. The project
-		// should be set via configuration instead of randomly taking the first.
-		networkName, err := getNetworkNameViaAPICall(service, config.NetworkProjectID)
-		if err != nil {
-			return nil, err
-		}
-		networkURL = gceNetworkURL(config.ApiEndpoint, netProjID, networkName)
-	} else if config.NetworkURL != "" {
+	if config.NetworkURL != "" {
 		networkURL = config.NetworkURL
-	} else {
+	} else if config.NetworkName != "" {
 		networkURL = gceNetworkURL(config.ApiEndpoint, netProjID, config.NetworkName)
+	} else {
+		// Other consumers may use the cloudprovider without utilizing the wrapped GCE API functions
+		// or functions requiring network/subnetwork URLs (e.g. Kubelet).
+		glog.Warningf("No network name or URL specified.")
 	}
 
 	if config.SubnetworkURL != "" {
 		subnetURL = config.SubnetworkURL
 	} else if config.SubnetworkName != "" {
 		subnetURL = gceSubnetworkURL(config.ApiEndpoint, netProjID, config.Region, config.SubnetworkName)
+	} else {
+		// Determine the type of network and attempt to discover the correct subnet for AUTO mode.
+		// Gracefully fail because kubelet calls CreateGCECloud without any config, and minions
+		// lack the proper credentials for API calls.
+		if networkName := lastComponent(networkURL); networkName != "" {
+			var n *compute.Network
+			if n, err = getNetwork(service, netProjID, networkName); err != nil {
+				glog.Warningf("Could not retrieve network %q; err: %v", networkName, err)
+			} else {
+				switch typeOfNetwork(n) {
+				case netTypeLegacy:
+					glog.Infof("Network %q is type legacy - no subnetwork", networkName)
+					isLegacyNetwork = true
+				case netTypeCustom:
+					glog.Warningf("Network %q is type custom - cannot auto select a subnetwork", networkName)
+				case netTypeAuto:
+					subnetURL, err = determineSubnetURL(service, netProjID, networkName, config.Region)
+					if err != nil {
+						glog.Warningf("Could not determine subnetwork for network %q and region %v; err: %v", networkName, config.Region, err)
+					} else {
+						glog.Infof("Auto selecting subnetwork %q", subnetURL)
+					}
+				}
+			}
+		}
 	}
 
 	if len(config.ManagedZones) == 0 {
@@ -459,7 +480,7 @@ func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
 			return nil, err
 		}
 	}
-	if len(config.ManagedZones) != 1 {
+	if len(config.ManagedZones) > 1 {
 		glog.Infof("managing multiple zones: %v", config.ManagedZones)
 	}
 
@@ -470,7 +491,7 @@ func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
 		serviceAlpha:             serviceAlpha,
 		serviceBeta:              serviceBeta,
 		containerService:         containerService,
-		cloudkmsService:          cloudkmsService,
+		tpuService:               tpuService,
 		projectID:                projID,
 		networkProjectID:         netProjID,
 		onXPN:                    onXPN,
@@ -478,6 +499,7 @@ func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
 		localZone:                config.Zone,
 		managedZones:             config.ManagedZones,
 		networkURL:               networkURL,
+		isLegacyNetwork:          isLegacyNetwork,
 		subnetworkURL:            subnetURL,
 		secondaryRangeName:       config.SecondaryRangeName,
 		nodeTags:                 config.NodeTags,
@@ -485,19 +507,53 @@ func CreateGCECloud(config *CloudConfig) (*GCECloud, error) {
 		useMetadataServer:        config.UseMetadataServer,
 		operationPollRateLimiter: operationPollRateLimiter,
 		AlphaFeatureGate:         config.AlphaFeatureGate,
+		nodeZones:                map[string]sets.String{},
 	}
 
-	gce.manager = &GCEServiceManager{gce}
-
-	// Registering the KMS plugin only the first time.
-	kmsPluginRegisterOnce.Do(func() {
-		// Register the Google Cloud KMS based service in the KMS plugin registry.
-		encryptionconfig.KMSPluginRegistry.Register(KMSServiceName, func(config io.Reader) (envelope.Service, error) {
-			return gce.getGCPCloudKMSService(config)
-		})
-	})
+	gce.manager = &gceServiceManager{gce}
+	gce.s = &cloud.Service{
+		GA:            service,
+		Alpha:         serviceAlpha,
+		Beta:          serviceBeta,
+		ProjectRouter: &gceProjectRouter{gce},
+		RateLimiter:   &gceRateLimiter{gce},
+	}
+	gce.c = cloud.NewGCE(gce.s)
 
 	return gce, nil
+}
+
+// SetRateLimiter adds a custom cloud.RateLimiter implementation.
+// WARNING: Calling this could have unexpected behavior if you have in-flight
+// requests. It is best to use this immediately after creating a GCECloud.
+func (g *GCECloud) SetRateLimiter(rl cloud.RateLimiter) {
+	if rl != nil {
+		g.s.RateLimiter = rl
+	}
+}
+
+// determineSubnetURL queries for all subnetworks in a region for a given network and returns
+// the URL of the subnetwork which exists in the auto-subnet range.
+func determineSubnetURL(service *compute.Service, networkProjectID, networkName, region string) (string, error) {
+	subnets, err := listSubnetworksOfNetwork(service, networkProjectID, networkName, region)
+	if err != nil {
+		return "", err
+	}
+
+	autoSubnets, err := subnetsInCIDR(subnets, autoSubnetIPRange)
+	if err != nil {
+		return "", err
+	}
+
+	if len(autoSubnets) == 0 {
+		return "", fmt.Errorf("no subnet exists in auto CIDR")
+	}
+
+	if len(autoSubnets) > 1 {
+		return "", fmt.Errorf("multiple subnetworks in the same region exist in auto CIDR")
+	}
+
+	return autoSubnets[0].SelfLink, nil
 }
 
 func tryConvertToProjectNames(configProject, configNetworkProject string, service *compute.Service) (projID, netProjID string) {
@@ -531,6 +587,14 @@ func tryConvertToProjectNames(configProject, configNetworkProject string, servic
 // This must be called before utilizing the funcs of gce.ClusterID
 func (gce *GCECloud) Initialize(clientBuilder controller.ControllerClientBuilder) {
 	gce.clientBuilder = clientBuilder
+	gce.client = clientBuilder.ClientOrDie("cloud-provider")
+
+	if gce.OnXPN() {
+		gce.eventBroadcaster = record.NewBroadcaster()
+		gce.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: gce.client.CoreV1().Events("")})
+		gce.eventRecorder = gce.eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "gce-cloudprovider"})
+	}
+
 	go gce.watchClusterID()
 }
 
@@ -593,18 +657,70 @@ func (gce *GCECloud) SubnetworkURL() string {
 	return gce.subnetworkURL
 }
 
-// Known-useless DNS search path.
-var uselessDNSSearchRE = regexp.MustCompile(`^[0-9]+.google.internal.$`)
+func (gce *GCECloud) IsLegacyNetwork() bool {
+	return gce.isLegacyNetwork
+}
 
-// ScrubDNS filters DNS settings for pods.
-func (gce *GCECloud) ScrubDNS(nameservers, searches []string) (nsOut, srchOut []string) {
-	// GCE has too many search paths by default. Filter the ones we know are useless.
-	for _, s := range searches {
-		if !uselessDNSSearchRE.MatchString(s) {
-			srchOut = append(srchOut, s)
+func (gce *GCECloud) SetInformers(informerFactory informers.SharedInformerFactory) {
+	glog.Infof("Setting up informers for GCECloud")
+	nodeInformer := informerFactory.Core().V1().Nodes().Informer()
+	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			node := obj.(*v1.Node)
+			gce.updateNodeZones(nil, node)
+		},
+		UpdateFunc: func(prev, obj interface{}) {
+			prevNode := prev.(*v1.Node)
+			newNode := obj.(*v1.Node)
+			if newNode.Labels[kubeletapis.LabelZoneFailureDomain] ==
+				prevNode.Labels[kubeletapis.LabelZoneFailureDomain] {
+				return
+			}
+			gce.updateNodeZones(prevNode, newNode)
+		},
+		DeleteFunc: func(obj interface{}) {
+			node, isNode := obj.(*v1.Node)
+			// We can get DeletedFinalStateUnknown instead of *v1.Node here
+			// and we need to handle that correctly.
+			if !isNode {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					glog.Errorf("Received unexpected object: %v", obj)
+					return
+				}
+				node, ok = deletedState.Obj.(*v1.Node)
+				if !ok {
+					glog.Errorf("DeletedFinalStateUnknown contained non-Node object: %v", deletedState.Obj)
+					return
+				}
+			}
+			gce.updateNodeZones(node, nil)
+		},
+	})
+	gce.nodeInformerSynced = nodeInformer.HasSynced
+}
+
+func (gce *GCECloud) updateNodeZones(prevNode, newNode *v1.Node) {
+	gce.nodeZonesLock.Lock()
+	defer gce.nodeZonesLock.Unlock()
+	if prevNode != nil {
+		prevZone, ok := prevNode.ObjectMeta.Labels[kubeletapis.LabelZoneFailureDomain]
+		if ok {
+			gce.nodeZones[prevZone].Delete(prevNode.ObjectMeta.Name)
+			if gce.nodeZones[prevZone].Len() == 0 {
+				gce.nodeZones[prevZone] = nil
+			}
 		}
 	}
-	return nameservers, srchOut
+	if newNode != nil {
+		newZone, ok := newNode.ObjectMeta.Labels[kubeletapis.LabelZoneFailureDomain]
+		if ok {
+			if gce.nodeZones[newZone] == nil {
+				gce.nodeZones[newZone] = sets.NewString()
+			}
+			gce.nodeZones[newZone].Insert(newNode.ObjectMeta.Name)
+		}
+	}
 }
 
 // HasClusterID returns true if the cluster has a clusterID
@@ -636,18 +752,18 @@ func gceSubnetworkURL(apiEndpoint, project, region, subnetwork string) string {
 	return apiEndpoint + strings.Join([]string{"projects", project, "regions", region, "subnetworks", subnetwork}, "/")
 }
 
-// getProjectIDInURL parses typical full resource URLS and shorter URLS
-// https://www.googleapis.com/compute/v1/projects/myproject/global/networks/mycustom
-// projects/myproject/global/networks/mycustom
-// All return "myproject"
-func getProjectIDInURL(urlStr string) (string, error) {
+// getRegionInURL parses full resource URLS and shorter URLS
+// https://www.googleapis.com/compute/v1/projects/myproject/regions/us-central1/subnetworks/a
+// projects/myproject/regions/us-central1/subnetworks/a
+// All return "us-central1"
+func getRegionInURL(urlStr string) string {
 	fields := strings.Split(urlStr, "/")
 	for i, v := range fields {
-		if v == "projects" && i < len(fields)-1 {
-			return fields[i+1], nil
+		if v == "regions" && i < len(fields)-1 {
+			return fields[i+1]
 		}
 	}
-	return "", fmt.Errorf("could not find project field in url: %v", urlStr)
+	return ""
 }
 
 func getNetworkNameViaMetadata() (string, error) {
@@ -662,18 +778,19 @@ func getNetworkNameViaMetadata() (string, error) {
 	return parts[3], nil
 }
 
-func getNetworkNameViaAPICall(svc *compute.Service, projectID string) (string, error) {
-	// TODO: use PageToken to list all not just the first 500
-	networkList, err := svc.Networks.List(projectID).Do()
-	if err != nil {
-		return "", err
-	}
+// getNetwork returns a GCP network
+func getNetwork(svc *compute.Service, networkProjectID, networkID string) (*compute.Network, error) {
+	return svc.Networks.Get(networkProjectID, networkID).Do()
+}
 
-	if networkList == nil || len(networkList.Items) <= 0 {
-		return "", fmt.Errorf("GCE Network List call returned no networks for project %q", projectID)
-	}
-
-	return networkList.Items[0].Name, nil
+// listSubnetworksOfNetwork returns a list of subnetworks for a particular region of a network.
+func listSubnetworksOfNetwork(svc *compute.Service, networkProjectID, networkID, region string) ([]*compute.Subnetwork, error) {
+	var subnets []*compute.Subnetwork
+	err := svc.Subnetworks.List(networkProjectID, region).Filter(fmt.Sprintf("network eq .*/%v$", networkID)).Pages(context.Background(), func(res *compute.SubnetworkList) error {
+		subnets = append(subnets, res.Items...)
+		return nil
+	})
+	return subnets, err
 }
 
 // getProjectID returns the project's string ID given a project number or string
@@ -708,6 +825,15 @@ func getZonesForRegion(svc *compute.Service, projectID, region string) ([]string
 	return zones, nil
 }
 
+func findSubnetForRegion(subnetURLs []string, region string) string {
+	for _, url := range subnetURLs {
+		if thisRegion := getRegionInURL(url); thisRegion == region {
+			return url
+		}
+	}
+	return ""
+}
+
 func newOauthClient(tokenSource oauth2.TokenSource) (*http.Client, error) {
 	if tokenSource == nil {
 		var err error
@@ -723,7 +849,13 @@ func newOauthClient(tokenSource oauth2.TokenSource) (*http.Client, error) {
 		glog.Infof("Using existing Token Source %#v", tokenSource)
 	}
 
-	if err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (bool, error) {
+	backoff := wait.Backoff{
+		// These values will add up to about a minute. See #56293 for background.
+		Duration: time.Second,
+		Factor:   1.4,
+		Steps:    10,
+	}
+	if err := wait.ExponentialBackoff(backoff, func() (bool, error) {
 		if _, err := tokenSource.Token(); err != nil {
 			glog.Errorf("error fetching initial token: %v", err)
 			return false, nil
@@ -736,119 +868,20 @@ func newOauthClient(tokenSource oauth2.TokenSource) (*http.Client, error) {
 	return oauth2.NewClient(oauth2.NoContext, tokenSource), nil
 }
 
-func (manager *GCEServiceManager) CreateDisk(
-	name string,
-	sizeGb int64,
-	tagsStr string,
-	diskTypeURI string,
-	zone string) (gceObject, error) {
-	if manager.gce.AlphaFeatureGate.Enabled(GCEDiskAlphaFeatureGate) {
-		diskToCreateAlpha := &computealpha.Disk{
-			Name:        name,
-			SizeGb:      sizeGb,
-			Description: tagsStr,
-			Type:        diskTypeURI,
-		}
-		return manager.gce.serviceAlpha.Disks.Insert(manager.gce.projectID, zone, diskToCreateAlpha).Do()
+func (manager *gceServiceManager) getProjectsAPIEndpoint() string {
+	projectsApiEndpoint := gceComputeAPIEndpoint + "projects/"
+	if manager.gce.service != nil {
+		projectsApiEndpoint = manager.gce.service.BasePath
 	}
 
-	diskToCreateV1 := &compute.Disk{
-		Name:        name,
-		SizeGb:      sizeGb,
-		Description: tagsStr,
-		Type:        diskTypeURI,
-	}
-	return manager.gce.service.Disks.Insert(manager.gce.projectID, zone, diskToCreateV1).Do()
+	return projectsApiEndpoint
 }
 
-func (manager *GCEServiceManager) AttachDisk(
-	diskName string,
-	diskKind string,
-	diskZone string,
-	readWrite string,
-	source string,
-	diskType string,
-	instanceName string) (gceObject, error) {
-	if manager.gce.AlphaFeatureGate.Enabled(GCEDiskAlphaFeatureGate) {
-		attachedDiskAlpha := &computealpha.AttachedDisk{
-			DeviceName: diskName,
-			Kind:       diskKind,
-			Mode:       readWrite,
-			Source:     source,
-			Type:       diskType,
-		}
-		return manager.gce.serviceAlpha.Instances.AttachDisk(
-			manager.gce.projectID, diskZone, instanceName, attachedDiskAlpha).Do()
+func (manager *gceServiceManager) getProjectsAPIEndpointBeta() string {
+	projectsApiEndpoint := gceComputeAPIEndpointBeta + "projects/"
+	if manager.gce.service != nil {
+		projectsApiEndpoint = manager.gce.serviceBeta.BasePath
 	}
 
-	attachedDiskV1 := &compute.AttachedDisk{
-		DeviceName: diskName,
-		Kind:       diskKind,
-		Mode:       readWrite,
-		Source:     source,
-		Type:       diskType,
-	}
-	return manager.gce.service.Instances.AttachDisk(
-		manager.gce.projectID, diskZone, instanceName, attachedDiskV1).Do()
-}
-
-func (manager *GCEServiceManager) DetachDisk(
-	instanceZone string,
-	instanceName string,
-	devicePath string) (gceObject, error) {
-	if manager.gce.AlphaFeatureGate.Enabled(GCEDiskAlphaFeatureGate) {
-		manager.gce.serviceAlpha.Instances.DetachDisk(
-			manager.gce.projectID, instanceZone, instanceName, devicePath).Do()
-	}
-
-	return manager.gce.service.Instances.DetachDisk(
-		manager.gce.projectID, instanceZone, instanceName, devicePath).Do()
-}
-
-func (manager *GCEServiceManager) GetDisk(
-	project string,
-	zone string,
-	diskName string) (*GCEDisk, error) {
-
-	if manager.gce.AlphaFeatureGate.Enabled(GCEDiskAlphaFeatureGate) {
-		diskAlpha, err := manager.gce.serviceAlpha.Disks.Get(project, zone, diskName).Do()
-		if err != nil {
-			return nil, err
-		}
-
-		return &GCEDisk{
-			Zone: lastComponent(diskAlpha.Zone),
-			Name: diskAlpha.Name,
-			Kind: diskAlpha.Kind,
-			Type: diskAlpha.Type,
-		}, nil
-	}
-
-	diskStable, err := manager.gce.service.Disks.Get(project, zone, diskName).Do()
-	if err != nil {
-		return nil, err
-	}
-
-	return &GCEDisk{
-		Zone: lastComponent(diskStable.Zone),
-		Name: diskStable.Name,
-		Kind: diskStable.Kind,
-		Type: diskStable.Type,
-	}, nil
-}
-
-func (manager *GCEServiceManager) DeleteDisk(
-	project string,
-	zone string,
-	diskName string) (gceObject, error) {
-
-	if manager.gce.AlphaFeatureGate.Enabled(GCEDiskAlphaFeatureGate) {
-		return manager.gce.serviceAlpha.Disks.Delete(project, zone, diskName).Do()
-	}
-
-	return manager.gce.service.Disks.Delete(project, zone, diskName).Do()
-}
-
-func (manager *GCEServiceManager) WaitForZoneOp(op gceObject, zone string, mc *metricContext) error {
-	return manager.gce.waitForZoneOp(op, zone, mc)
+	return projectsApiEndpoint
 }

@@ -18,6 +18,7 @@ go_library(
         "version_command.go",
         "watch_command.go",
     ],
+    importpath = "github.com/onsi/ginkgo/ginkgo",
     visibility = ["//visibility:private"],
     deps = [
         "//vendor/github.com/onsi/ginkgo/config:go_default_library",
@@ -34,7 +35,7 @@ go_library(
 
 go_binary(
     name = "ginkgo",
-    library = ":go_default_library",
+    embed = [":go_default_library"],
     visibility = ["//visibility:public"],
 )
 

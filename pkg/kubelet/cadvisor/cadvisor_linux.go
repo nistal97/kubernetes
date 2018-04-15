@@ -32,7 +32,6 @@ import (
 	"github.com/google/cadvisor/cache/memory"
 	cadvisormetrics "github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/events"
-	cadvisorfs "github.com/google/cadvisor/fs"
 	cadvisorhttp "github.com/google/cadvisor/http"
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
@@ -44,8 +43,8 @@ import (
 )
 
 type cadvisorClient struct {
-	runtime  string
-	rootPath string
+	imageFsInfoProvider ImageFsInfoProvider
+	rootPath            string
 	manager.Manager
 }
 
@@ -106,11 +105,20 @@ func containerLabels(c *cadvisorapi.ContainerInfo) map[string]string {
 }
 
 // New creates a cAdvisor and exports its API on the specified port if port > 0.
-func New(address string, port uint, runtime string, rootPath string) (Interface, error) {
+func New(address string, port uint, imageFsInfoProvider ImageFsInfoProvider, rootPath string, usingLegacyStats bool) (Interface, error) {
 	sysFs := sysfs.NewRealSysFs()
 
+	ignoreMetrics := cadvisormetrics.MetricSet{
+		cadvisormetrics.NetworkTcpUsageMetrics: struct{}{},
+		cadvisormetrics.NetworkUdpUsageMetrics: struct{}{},
+		cadvisormetrics.PerCpuUsageMetrics:     struct{}{},
+	}
+	if !usingLegacyStats {
+		ignoreMetrics[cadvisormetrics.DiskUsageMetrics] = struct{}{}
+	}
+
 	// Create and start the cAdvisor container manager.
-	m, err := manager.New(memory.New(statsCacheDuration, nil), sysFs, maxHousekeepingInterval, allowDynamicHousekeeping, cadvisormetrics.MetricSet{cadvisormetrics.NetworkTcpUsageMetrics: struct{}{}, cadvisormetrics.NetworkUdpUsageMetrics: struct{}{}}, http.DefaultClient)
+	m, err := manager.New(memory.New(statsCacheDuration, nil), sysFs, maxHousekeepingInterval, allowDynamicHousekeeping, ignoreMetrics, http.DefaultClient)
 	if err != nil {
 		return nil, err
 	}
@@ -126,9 +134,9 @@ func New(address string, port uint, runtime string, rootPath string) (Interface,
 	}
 
 	cadvisorClient := &cadvisorClient{
-		runtime:  runtime,
-		rootPath: rootPath,
-		Manager:  m,
+		imageFsInfoProvider: imageFsInfoProvider,
+		rootPath:            rootPath,
+		Manager:             m,
 	}
 
 	err = cadvisorClient.exportHTTP(address, port)
@@ -208,17 +216,10 @@ func (cc *cadvisorClient) MachineInfo() (*cadvisorapi.MachineInfo, error) {
 }
 
 func (cc *cadvisorClient) ImagesFsInfo() (cadvisorapiv2.FsInfo, error) {
-	var label string
-
-	switch cc.runtime {
-	case "docker":
-		label = cadvisorfs.LabelDockerImages
-	case "rkt":
-		label = cadvisorfs.LabelRktImages
-	default:
-		return cadvisorapiv2.FsInfo{}, fmt.Errorf("ImagesFsInfo: unknown runtime: %v", cc.runtime)
+	label, err := cc.imageFsInfoProvider.ImageFsInfoLabel()
+	if err != nil {
+		return cadvisorapiv2.FsInfo{}, err
 	}
-
 	return cc.getFsInfo(label)
 }
 
@@ -244,17 +245,4 @@ func (cc *cadvisorClient) getFsInfo(label string) (cadvisorapiv2.FsInfo, error) 
 
 func (cc *cadvisorClient) WatchEvents(request *events.Request) (*events.EventChannel, error) {
 	return cc.WatchForEvents(request)
-}
-
-// HasDedicatedImageFs returns true if the imagefs has a dedicated device.
-func (cc *cadvisorClient) HasDedicatedImageFs() (bool, error) {
-	imageFsInfo, err := cc.ImagesFsInfo()
-	if err != nil {
-		return false, err
-	}
-	rootFsInfo, err := cc.RootFsInfo()
-	if err != nil {
-		return false, err
-	}
-	return imageFsInfo.Device != rootFsInfo.Device, nil
 }

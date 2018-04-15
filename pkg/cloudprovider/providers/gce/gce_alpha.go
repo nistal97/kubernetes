@@ -18,17 +18,16 @@ package gce
 
 import (
 	"fmt"
-
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
-// All known alpha features
-var knownAlphaFeatures = map[string]bool{
-	GCEDiskAlphaFeatureGate: true,
-}
-
 const (
-	GCEDiskAlphaFeatureGate = "GCEDiskAlphaAPI"
+	// alpha: v1.8 (for Services)
+	//
+	// Allows Services backed by a GCP load balancer to choose what network
+	// tier to use. Currently supports "Standard" and "Premium" (default).
+	AlphaFeatureNetworkTiers = "NetworkTiers"
+
+	AlphaFeatureNetworkEndpointGroup = "NetworkEndpointGroup"
 )
 
 type AlphaFeatureGate struct {
@@ -39,15 +38,17 @@ func (af *AlphaFeatureGate) Enabled(key string) bool {
 	return af.features[key]
 }
 
-func NewAlphaFeatureGate(features []string) (*AlphaFeatureGate, error) {
-	errList := []error{}
+func NewAlphaFeatureGate(features []string) *AlphaFeatureGate {
 	featureMap := make(map[string]bool)
 	for _, name := range features {
-		if _, ok := knownAlphaFeatures[name]; !ok {
-			errList = append(errList, fmt.Errorf("alpha feature %q is not supported.", name))
-		} else {
-			featureMap[name] = true
-		}
+		featureMap[name] = true
 	}
-	return &AlphaFeatureGate{featureMap}, utilerrors.NewAggregate(errList)
+	return &AlphaFeatureGate{featureMap}
+}
+
+func (gce *GCECloud) alphaFeatureEnabled(feature string) error {
+	if !gce.AlphaFeatureGate.Enabled(feature) {
+		return fmt.Errorf("alpha feature %q is not enabled.", feature)
+	}
+	return nil
 }

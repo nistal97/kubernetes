@@ -15,7 +15,7 @@
 # Build the node-test image.
 #
 # Usage:
-#   [ARCH=amd64] [REGISTRY="gcr.io/google_containers"] [BIN_DIR="../../../../_output/bin"] make (build|push) VERSION={some_version_number e.g. 0.1}
+#   [ARCH=amd64] [REGISTRY="staging-k8s.gcr.io"] [BIN_DIR="../../../../_output/bin"] make (build|push) VERSION={some_version_number e.g. 0.1}
 
 # SYSTEM_SPEC_NAME is the name of the system spec used for the node conformance
 # test. The specs are expected to be in SYSTEM_SPEC_DIR.
@@ -23,7 +23,7 @@ SYSTEM_SPEC_NAME?=
 SYSTEM_SPEC_DIR?=../../system/specs
 
 # TODO(random-liu): Add this into release progress.
-REGISTRY?=gcr.io/google_containers
+REGISTRY?=staging-k8s.gcr.io
 ARCH?=amd64
 # BIN_DIR is the directory to find binaries, overwrite with ../../../../_output/bin
 # for local development.
@@ -31,8 +31,8 @@ BIN_DIR?=../../../../_output/dockerized/bin/linux/${ARCH}
 TEMP_DIR:=$(shell mktemp -d)
 
 BASEIMAGE_amd64=debian:jessie
-BASEIMAGE_arm=armhf/debian:jessie
-BASEIMAGE_arm64=aarch64/debian:jessie
+BASEIMAGE_arm=arm32v7/debian:jessie
+BASEIMAGE_arm64=arm64v8/debian:jessie
 BASEIMAGE_ppc64le=ppc64le/debian:jessie
 
 BASEIMAGE?=${BASEIMAGE_${ARCH}}
@@ -76,10 +76,10 @@ endif
 	docker build --pull -t ${IMAGE_NAME}-${ARCH}:${VERSION} ${TEMP_DIR}
 
 push: build
-	gcloud docker -- push ${IMAGE_NAME}-${ARCH}:${VERSION}
+	docker push ${IMAGE_NAME}-${ARCH}:${VERSION}
 ifeq ($(ARCH),amd64)
 	docker tag ${IMAGE_NAME}-${ARCH}:${VERSION} ${IMAGE_NAME}:${VERSION}
-	gcloud docker -- push ${IMAGE_NAME}:${VERSION}
+	docker push ${IMAGE_NAME}:${VERSION}
 endif
 
 .PHONY: all

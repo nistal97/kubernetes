@@ -12,8 +12,10 @@ go_library(
         "fake_eviction.go",
         "fake_eviction_expansion.go",
         "fake_poddisruptionbudget.go",
+        "fake_podsecuritypolicy.go",
         "fake_policy_client.go",
     ],
+    importpath = "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/policy/internalversion/fake",
     deps = [
         "//pkg/apis/policy:go_default_library",
         "//pkg/client/clientset_generated/internalclientset/typed/policy/internalversion:go_default_library",

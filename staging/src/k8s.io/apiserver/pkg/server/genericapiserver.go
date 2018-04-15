@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilwaitgroup "k8s.io/apimachinery/pkg/util/waitgroup"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/audit"
 	genericapi "k8s.io/apiserver/pkg/endpoints"
@@ -70,12 +71,6 @@ type APIGroupInfo struct {
 	NegotiatedSerializer runtime.NegotiatedSerializer
 	// ParameterCodec performs conversions for query parameters passed to API calls
 	ParameterCodec runtime.ParameterCodec
-
-	// SubresourceGroupVersionKind contains the GroupVersionKind overrides for each subresource that is
-	// accessible from this API group version. The GroupVersionKind is that of the external version of
-	// the subresource. The key of this map should be the path of the subresource. The keys here should
-	// match the keys in the Storage map above for subresources.
-	SubresourceGroupVersionKind map[string]schema.GroupVersionKind
 }
 
 // GenericAPIServer contains state for a Kubernetes cluster api server.
@@ -89,6 +84,10 @@ type GenericAPIServer struct {
 	// minRequestTimeout is how short the request timeout can be.  This is used to build the RESTHandler
 	minRequestTimeout time.Duration
 
+	// ShutdownTimeout is the timeout used for server shutdown. This specifies the timeout before server
+	// gracefully shutdown returns.
+	ShutdownTimeout time.Duration
+
 	// legacyAPIGroupPrefixes is used to set up URL parsing for authorization and for validating requests
 	// to InstallLegacyAPIGroup
 	legacyAPIGroupPrefixes sets.String
@@ -96,13 +95,8 @@ type GenericAPIServer struct {
 	// admissionControl is used to build the RESTStorage that backs an API Group.
 	admissionControl admission.Interface
 
-	// requestContextMapper provides a way to get the context for a request.  It may be nil.
-	requestContextMapper apirequest.RequestContextMapper
-
+	// SecureServingInfo holds configuration of the TLS server.
 	SecureServingInfo *SecureServingInfo
-
-	// numerical ports, set after listening
-	effectiveSecurePort int
 
 	// ExternalAddress is the address (hostname or IP and port) that should be used in
 	// external (public internet) URLs for this GenericAPIServer.
@@ -134,6 +128,10 @@ type GenericAPIServer struct {
 	postStartHooksCalled   bool
 	disabledPostStartHooks sets.String
 
+	preShutdownHookLock    sync.Mutex
+	preShutdownHooks       map[string]preShutdownHookEntry
+	preShutdownHooksCalled bool
+
 	// healthz checks
 	healthzLock    sync.Mutex
 	healthzChecks  []healthz.HealthzChecker
@@ -145,6 +143,12 @@ type GenericAPIServer struct {
 	// enableAPIResponseCompression indicates whether API Responses should support compression
 	// if the client requests it via Accept-Encoding
 	enableAPIResponseCompression bool
+
+	// delegationTarget is the next delegate in the chain. This is never nil.
+	delegationTarget DelegationTarget
+
+	// HandlerChainWaitGroup allows you to wait for all chain handlers finish after the server shutdown.
+	HandlerChainWaitGroup *utilwaitgroup.SafeWaitGroup
 }
 
 // DelegationTarget is an interface which allows for composition of API servers with top level handling that works
@@ -160,11 +164,17 @@ type DelegationTarget interface {
 	// PostStartHooks returns the post-start hooks that need to be combined
 	PostStartHooks() map[string]postStartHookEntry
 
+	// PreShutdownHooks returns the pre-stop hooks that need to be combined
+	PreShutdownHooks() map[string]preShutdownHookEntry
+
 	// HealthzChecks returns the healthz checks that need to be combined
 	HealthzChecks() []healthz.HealthzChecker
 
 	// ListedPaths returns the paths for supporting an index
 	ListedPaths() []string
+
+	// NextDelegate returns the next delegationTarget in the chain of delegations
+	NextDelegate() DelegationTarget
 }
 
 func (s *GenericAPIServer) UnprotectedHandler() http.Handler {
@@ -174,6 +184,9 @@ func (s *GenericAPIServer) UnprotectedHandler() http.Handler {
 func (s *GenericAPIServer) PostStartHooks() map[string]postStartHookEntry {
 	return s.postStartHooks
 }
+func (s *GenericAPIServer) PreShutdownHooks() map[string]preShutdownHookEntry {
+	return s.preShutdownHooks
+}
 func (s *GenericAPIServer) HealthzChecks() []healthz.HealthzChecker {
 	return s.healthzChecks
 }
@@ -181,12 +194,18 @@ func (s *GenericAPIServer) ListedPaths() []string {
 	return s.listedPathProvider.ListedPaths()
 }
 
-var EmptyDelegate = emptyDelegate{
-	requestContextMapper: apirequest.NewRequestContextMapper(),
+func (s *GenericAPIServer) NextDelegate() DelegationTarget {
+	return s.delegationTarget
 }
 
 type emptyDelegate struct {
 	requestContextMapper apirequest.RequestContextMapper
+}
+
+func NewEmptyDelegate() DelegationTarget {
+	return emptyDelegate{
+		requestContextMapper: apirequest.NewRequestContextMapper(),
+	}
 }
 
 func (s emptyDelegate) UnprotectedHandler() http.Handler {
@@ -194,6 +213,9 @@ func (s emptyDelegate) UnprotectedHandler() http.Handler {
 }
 func (s emptyDelegate) PostStartHooks() map[string]postStartHookEntry {
 	return map[string]postStartHookEntry{}
+}
+func (s emptyDelegate) PreShutdownHooks() map[string]preShutdownHookEntry {
+	return map[string]preShutdownHookEntry{}
 }
 func (s emptyDelegate) HealthzChecks() []healthz.HealthzChecker {
 	return []healthz.HealthzChecker{}
@@ -204,19 +226,15 @@ func (s emptyDelegate) ListedPaths() []string {
 func (s emptyDelegate) RequestContextMapper() apirequest.RequestContextMapper {
 	return s.requestContextMapper
 }
+func (s emptyDelegate) NextDelegate() DelegationTarget {
+	return nil
+}
 
-// RequestContextMapper is exposed so that third party resource storage can be build in a different location.
-// TODO refactor third party resource storage
 func (s *GenericAPIServer) RequestContextMapper() apirequest.RequestContextMapper {
-	return s.requestContextMapper
+	return s.delegationTarget.RequestContextMapper()
 }
 
-// MinRequestTimeout is exposed so that third party resource storage can be build in a different location.
-// TODO refactor third party resource storage
-func (s *GenericAPIServer) MinRequestTimeout() time.Duration {
-	return s.minRequestTimeout
-}
-
+// preparedGenericAPIServer is a private wrapper that enforces a call of PrepareRun() before Run can be invoked.
 type preparedGenericAPIServer struct {
 	*GenericAPIServer
 }
@@ -234,6 +252,14 @@ func (s *GenericAPIServer) PrepareRun() preparedGenericAPIServer {
 
 	s.installHealthz()
 
+	// Register audit backend preShutdownHook.
+	if s.AuditBackend != nil {
+		s.AddPreShutdownHook("audit-backend", func() error {
+			s.AuditBackend.Shutdown()
+			return nil
+		})
+	}
+
 	return preparedGenericAPIServer{s}
 }
 
@@ -247,9 +273,13 @@ func (s preparedGenericAPIServer) Run(stopCh <-chan struct{}) error {
 
 	<-stopCh
 
-	if s.GenericAPIServer.AuditBackend != nil {
-		s.GenericAPIServer.AuditBackend.Shutdown()
+	err = s.RunPreShutdownHooks()
+	if err != nil {
+		return err
 	}
+
+	// Wait for all requests to finish, which are bounded by the RequestTimeout variable.
+	s.HandlerChainWaitGroup.Wait()
 
 	return nil
 }
@@ -257,11 +287,23 @@ func (s preparedGenericAPIServer) Run(stopCh <-chan struct{}) error {
 // NonBlockingRun spawns the secure http server. An error is
 // returned if the secure port cannot be listened on.
 func (s preparedGenericAPIServer) NonBlockingRun(stopCh <-chan struct{}) error {
+	// Use an stop channel to allow graceful shutdown without dropping audit events
+	// after http server shutdown.
+	auditStopCh := make(chan struct{})
+
+	// Start the audit backend before any request comes in. This means we must call Backend.Run
+	// before http server start serving. Otherwise the Backend.ProcessEvents call might block.
+	if s.AuditBackend != nil {
+		if err := s.AuditBackend.Run(auditStopCh); err != nil {
+			return fmt.Errorf("failed to run the audit backend: %v", err)
+		}
+	}
+
 	// Use an internal stop channel to allow cleanup of the listeners on error.
 	internalStopCh := make(chan struct{})
 
 	if s.SecureServingInfo != nil && s.Handler != nil {
-		if err := s.serveSecurely(internalStopCh); err != nil {
+		if err := s.SecureServingInfo.Serve(s.Handler, s.ShutdownTimeout, internalStopCh); err != nil {
 			close(internalStopCh)
 			return err
 		}
@@ -273,15 +315,9 @@ func (s preparedGenericAPIServer) NonBlockingRun(stopCh <-chan struct{}) error {
 	go func() {
 		<-stopCh
 		close(internalStopCh)
+		s.HandlerChainWaitGroup.Wait()
+		close(auditStopCh)
 	}()
-
-	// Start the audit backend before any request comes in. This means we cannot turn it into a
-	// post start hook because without calling Backend.Run the Backend.ProcessEvents call might block.
-	if s.AuditBackend != nil {
-		if err := s.AuditBackend.Run(stopCh); err != nil {
-			return fmt.Errorf("failed to run the audit backend: %v", err)
-		}
-	}
 
 	s.RunPostStartHooks(stopCh)
 
@@ -290,11 +326,6 @@ func (s preparedGenericAPIServer) NonBlockingRun(stopCh <-chan struct{}) error {
 	}
 
 	return nil
-}
-
-// EffectiveSecurePort returns the secure port we bound to.
-func (s *GenericAPIServer) EffectiveSecurePort() int {
-	return s.effectiveSecurePort
 }
 
 // installAPIResources is a private method for installing the REST storage backing each api groupversionresource
@@ -311,7 +342,7 @@ func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *A
 		}
 
 		if err := apiGroupVersion.InstallREST(s.Handler.GoRestfulContainer); err != nil {
-			return fmt.Errorf("Unable to setup API %v: %v", apiGroupInfo, err)
+			return fmt.Errorf("unable to setup API %v: %v", apiGroupInfo, err)
 		}
 	}
 
@@ -333,7 +364,8 @@ func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo 
 	}
 	// Install the version handler.
 	// Add a handler at /<apiPrefix> to enumerate the supported api versions.
-	s.Handler.GoRestfulContainer.Add(discovery.NewLegacyRootAPIHandler(s.discoveryAddresses, s.Serializer, apiPrefix, apiVersions, s.requestContextMapper).WebService())
+	s.Handler.GoRestfulContainer.Add(discovery.NewLegacyRootAPIHandler(s.discoveryAddresses, s.Serializer, apiPrefix, apiVersions, s.delegationTarget.RequestContextMapper()).WebService())
+
 	return nil
 }
 
@@ -377,7 +409,7 @@ func (s *GenericAPIServer) InstallAPIGroup(apiGroupInfo *APIGroupInfo) error {
 	}
 
 	s.DiscoveryGroupManager.AddGroup(apiGroup)
-	s.Handler.GoRestfulContainer.Add(discovery.NewAPIGroupHandler(s.Serializer, apiGroup, s.requestContextMapper).WebService())
+	s.Handler.GoRestfulContainer.Add(discovery.NewAPIGroupHandler(s.Serializer, apiGroup, s.delegationTarget.RequestContextMapper()).WebService())
 
 	return nil
 }
@@ -403,12 +435,10 @@ func (s *GenericAPIServer) newAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupV
 		Creater:         apiGroupInfo.Scheme,
 		Convertor:       apiGroupInfo.Scheme,
 		UnsafeConvertor: runtime.UnsafeObjectConvertor(apiGroupInfo.Scheme),
-		Copier:          apiGroupInfo.Scheme,
 		Defaulter:       apiGroupInfo.Scheme,
 		Typer:           apiGroupInfo.Scheme,
-		SubresourceGroupVersionKind: apiGroupInfo.SubresourceGroupVersionKind,
-		Linker: apiGroupInfo.GroupMeta.SelfLinker,
-		Mapper: apiGroupInfo.GroupMeta.RESTMapper,
+		Linker:          apiGroupInfo.GroupMeta.SelfLinker,
+		Mapper:          apiGroupInfo.GroupMeta.RESTMapper,
 
 		Admit:                        s.admissionControl,
 		Context:                      s.RequestContextMapper(),

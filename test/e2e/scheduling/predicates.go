@@ -28,9 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	clientset "k8s.io/client-go/kubernetes"
+	utilversion "k8s.io/kubernetes/pkg/util/version"
 	"k8s.io/kubernetes/test/e2e/common"
 	"k8s.io/kubernetes/test/e2e/framework"
 	testutils "k8s.io/kubernetes/test/utils"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -38,7 +40,8 @@ import (
 )
 
 const maxNumberOfPods int64 = 10
-const minPodCPURequest int64 = 500
+
+var localStorageVersion = utilversion.MustParseSemantic("v1.8.0-beta.0")
 
 // variable set in BeforeEach, never modified afterwards
 var masterNodes sets.String
@@ -52,6 +55,7 @@ type pausePodConfig struct {
 	NodeName                          string
 	Ports                             []v1.ContainerPort
 	OwnerReferences                   []metav1.OwnerReference
+	PriorityClassName                 string
 }
 
 var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
@@ -68,7 +72,7 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 		rc, err := cs.CoreV1().ReplicationControllers(ns).Get(RCName, metav1.GetOptions{})
 		if err == nil && *(rc.Spec.Replicas) != 0 {
 			By("Cleaning up the replication controller")
-			err := framework.DeleteRCAndPods(f.ClientSet, f.InternalClientset, ns, RCName)
+			err := framework.DeleteRCAndPods(f.ClientSet, f.InternalClientset, f.ScalesGetter, ns, RCName)
 			framework.ExpectNoError(err)
 		}
 	})
@@ -144,14 +148,17 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 		WaitForSchedulerAfterAction(f, createPausePodAction(f, pausePodConfig{
 			Name:   podName,
 			Labels: map[string]string{"name": "additional"},
-		}), podName, false)
+		}), ns, podName, false)
 		verifyResult(cs, podsNeededForSaturation, 1, ns)
 	})
 
 	// This test verifies we don't allow scheduling of pods in a way that sum of local ephemeral storage limits of pods is greater than machines capacity.
 	// It assumes that cluster add-on pods stay stable and cannot be run in parallel with any other test that touches Nodes or Pods.
 	// It is so because we need to have precise control on what's running in the cluster.
-	It("validates local ephemeral storage resource limits of pods that are allowed to run [Conformance]", func() {
+	It("validates local ephemeral storage resource limits of pods that are allowed to run [Feature:LocalStorageCapacityIsolation]", func() {
+
+		framework.SkipUnlessServerVersionGTE(localStorageVersion, f.ClientSet.Discovery())
+
 		nodeMaxAllocatable := int64(0)
 
 		nodeToAllocatableMap := make(map[string]int64)
@@ -216,18 +223,45 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 				},
 			},
 		}
-		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), podName, false)
+		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), ns, podName, false)
 		verifyResult(cs, podsNeededForSaturation, 1, ns)
 	})
 
-	// This test verifies we don't allow scheduling of pods in a way that sum of limits of pods is greater than machines capacity.
-	// It assumes that cluster add-on pods stay stable and cannot be run in parallel with any other test that touches Nodes or Pods.
+	// This test verifies we don't allow scheduling of pods in a way that sum of
+	// limits of pods is greater than machines capacity.
+	// It assumes that cluster add-on pods stay stable and cannot be run in parallel
+	// with any other test that touches Nodes or Pods.
 	// It is so because we need to have precise control on what's running in the cluster.
-	It("validates resource limits of pods that are allowed to run [Conformance]", func() {
+	// Test scenario:
+	// 1. Find the amount CPU resources on each node.
+	// 2. Create one pod with affinity to each node that uses 70% of the node CPU.
+	// 3. Wait for the pods to be scheduled.
+	// 4. Create another pod with no affinity to any node that need 50% of the largest node CPU.
+	// 5. Make sure this additional pod is not scheduled.
+	/*
+		    Testname: scheduler-resource-limits
+		    Description: Ensure that scheduler accounts node resources correctly
+			and respects pods' resource requirements during scheduling.
+	*/
+	framework.ConformanceIt("validates resource limits of pods that are allowed to run ", func() {
+		framework.WaitForStableCluster(cs, masterNodes)
 		nodeMaxAllocatable := int64(0)
-
 		nodeToAllocatableMap := make(map[string]int64)
 		for _, node := range nodeList.Items {
+			nodeReady := false
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == v1.NodeReady && condition.Status == v1.ConditionTrue {
+					nodeReady = true
+					break
+				}
+			}
+			if !nodeReady {
+				continue
+			}
+			// Apply node label to each node
+			framework.AddOrUpdateLabelOnNode(cs, node.Name, "node", node.Name)
+			framework.ExpectNodeHasLabel(cs, node.Name, "node", node.Name)
+			// Find allocatable amount of CPU.
 			allocatable, found := node.Status.Allocatable[v1.ResourceCPU]
 			Expect(found).To(Equal(true))
 			nodeToAllocatableMap[node.Name] = allocatable.MilliValue()
@@ -235,7 +269,12 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 				nodeMaxAllocatable = allocatable.MilliValue()
 			}
 		}
-		framework.WaitForStableCluster(cs, masterNodes)
+		// Clean up added labels after this test.
+		defer func() {
+			for nodeName := range nodeToAllocatableMap {
+				framework.RemoveLabelOffNode(cs, nodeName, "node")
+			}
+		}()
 
 		pods, err := cs.CoreV1().Pods(metav1.NamespaceAll).List(metav1.ListOptions{})
 		framework.ExpectNoError(err)
@@ -247,56 +286,70 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 			}
 		}
 
-		var podsNeededForSaturation int
-
-		milliCpuPerPod := nodeMaxAllocatable / maxNumberOfPods
-		if milliCpuPerPod < minPodCPURequest {
-			milliCpuPerPod = minPodCPURequest
-		}
-		framework.Logf("Using pod capacity: %vm", milliCpuPerPod)
-		for name, leftAllocatable := range nodeToAllocatableMap {
-			framework.Logf("Node: %v has cpu allocatable: %vm", name, leftAllocatable)
-			podsNeededForSaturation += (int)(leftAllocatable / milliCpuPerPod)
-		}
-
-		By(fmt.Sprintf("Starting additional %v Pods to fully saturate the cluster CPU and trying to start another one", podsNeededForSaturation))
-
-		// As the pods are distributed randomly among nodes,
-		// it can easily happen that all nodes are saturated
-		// and there is no need to create additional pods.
-		// StartPods requires at least one pod to replicate.
-		if podsNeededForSaturation > 0 {
-			framework.ExpectNoError(testutils.StartPods(cs, podsNeededForSaturation, ns, "overcommit",
-				*initPausePod(f, pausePodConfig{
-					Name:   "",
-					Labels: map[string]string{"name": ""},
-					Resources: &v1.ResourceRequirements{
-						Limits: v1.ResourceList{
-							v1.ResourceCPU: *resource.NewMilliQuantity(milliCpuPerPod, "DecimalSI"),
-						},
-						Requests: v1.ResourceList{
-							v1.ResourceCPU: *resource.NewMilliQuantity(milliCpuPerPod, "DecimalSI"),
+		By("Starting Pods to consume most of the cluster CPU.")
+		// Create one pod per node that requires 70% of the node remaining CPU.
+		fillerPods := []*v1.Pod{}
+		for nodeName, cpu := range nodeToAllocatableMap {
+			requestedCPU := cpu * 7 / 10
+			fillerPods = append(fillerPods, createPausePod(f, pausePodConfig{
+				Name: "filler-pod-" + string(uuid.NewUUID()),
+				Resources: &v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceCPU: *resource.NewMilliQuantity(requestedCPU, "DecimalSI"),
+					},
+					Requests: v1.ResourceList{
+						v1.ResourceCPU: *resource.NewMilliQuantity(requestedCPU, "DecimalSI"),
+					},
+				},
+				Affinity: &v1.Affinity{
+					NodeAffinity: &v1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+							NodeSelectorTerms: []v1.NodeSelectorTerm{
+								{
+									MatchExpressions: []v1.NodeSelectorRequirement{
+										{
+											Key:      "node",
+											Operator: v1.NodeSelectorOpIn,
+											Values:   []string{nodeName},
+										},
+									},
+								},
+							},
 						},
 					},
-				}), true, framework.Logf))
+				},
+			}))
 		}
+		// Wait for filler pods to schedule.
+		for _, pod := range fillerPods {
+			framework.ExpectNoError(framework.WaitForPodRunningInNamespace(cs, pod))
+		}
+		By("Creating another pod that requires unavailable amount of CPU.")
+		// Create another pod that requires 50% of the largest node CPU resources.
+		// This pod should remain pending as at least 70% of CPU of other nodes in
+		// the cluster are already consumed.
 		podName := "additional-pod"
 		conf := pausePodConfig{
 			Name:   podName,
 			Labels: map[string]string{"name": "additional"},
 			Resources: &v1.ResourceRequirements{
 				Limits: v1.ResourceList{
-					v1.ResourceCPU: *resource.NewMilliQuantity(milliCpuPerPod, "DecimalSI"),
+					v1.ResourceCPU: *resource.NewMilliQuantity(nodeMaxAllocatable*5/10, "DecimalSI"),
 				},
 			},
 		}
-		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), podName, false)
-		verifyResult(cs, podsNeededForSaturation, 1, ns)
+		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), ns, podName, false)
+		verifyResult(cs, len(fillerPods), 1, ns)
 	})
 
 	// Test Nodes does not have any label, hence it should be impossible to schedule Pod with
 	// nonempty Selector set.
-	It("validates that NodeSelector is respected if not matching [Conformance]", func() {
+	/*
+		    Testname: scheduler-node-selector-not-matching
+		    Description: Ensure that scheduler respects the NodeSelector field of
+			PodSpec during scheduling (when it does not match any node).
+	*/
+	framework.ConformanceIt("validates that NodeSelector is respected if not matching ", func() {
 		By("Trying to schedule Pod with nonempty NodeSelector.")
 		podName := "restricted-pod"
 
@@ -310,7 +363,7 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 			},
 		}
 
-		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), podName, false)
+		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), ns, podName, false)
 		verifyResult(cs, 0, 1, ns)
 	})
 
@@ -337,7 +390,12 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 		}
 	})
 
-	It("validates that NodeSelector is respected if matching [Conformance]", func() {
+	/*
+		    Testname: scheduler-node-selector-matching
+		    Description: Ensure that scheduler respects the NodeSelector field
+			of PodSpec during scheduling (when it matches).
+	*/
+	framework.ConformanceIt("validates that NodeSelector is respected if matching ", func() {
 		nodeName := GetNodeThatCanRunPod(f)
 
 		By("Trying to apply a random label on the found node.")
@@ -404,7 +462,7 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 			},
 			Labels: map[string]string{"name": "restricted"},
 		}
-		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), podName, false)
+		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), ns, podName, false)
 		verifyResult(cs, 0, 1, ns)
 	})
 
@@ -528,12 +586,62 @@ var _ = SIGDescribe("SchedulerPredicates [Serial]", func() {
 			NodeSelector: map[string]string{labelKey: labelValue},
 		}
 
-		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), podNameNoTolerations, false)
+		WaitForSchedulerAfterAction(f, createPausePodAction(f, conf), ns, podNameNoTolerations, false)
 		verifyResult(cs, 0, 1, ns)
 
 		By("Removing taint off the node")
-		WaitForSchedulerAfterAction(f, removeTaintFromNodeAction(cs, nodeName, testTaint), podNameNoTolerations, true)
+		WaitForSchedulerAfterAction(f, removeTaintFromNodeAction(cs, nodeName, testTaint), ns, podNameNoTolerations, true)
 		verifyResult(cs, 1, 0, ns)
+	})
+
+	It("validates that there is no conflict between pods with same hostPort but different hostIP and protocol", func() {
+
+		nodeName := GetNodeThatCanRunPod(f)
+
+		// use nodeSelector to make sure the testing pods get assigned on the same node to explicitly verify there exists conflict or not
+		By("Trying to apply a random label on the found node.")
+		k := fmt.Sprintf("kubernetes.io/e2e-%s", string(uuid.NewUUID()))
+		v := "90"
+
+		nodeSelector := make(map[string]string)
+		nodeSelector[k] = v
+
+		framework.AddOrUpdateLabelOnNode(cs, nodeName, k, v)
+		framework.ExpectNodeHasLabel(cs, nodeName, k, v)
+		defer framework.RemoveLabelOffNode(cs, nodeName, k)
+
+		port := int32(54321)
+		By(fmt.Sprintf("Trying to create a pod(pod1) with hostport %v and hostIP 127.0.0.1 and expect scheduled", port))
+		creatHostPortPodOnNode(f, "pod1", ns, "127.0.0.1", port, v1.ProtocolTCP, nodeSelector, true)
+
+		By(fmt.Sprintf("Trying to create another pod(pod2) with hostport %v but hostIP 127.0.0.2 on the node which pod1 resides and expect scheduled", port))
+		creatHostPortPodOnNode(f, "pod2", ns, "127.0.0.2", port, v1.ProtocolTCP, nodeSelector, true)
+
+		By(fmt.Sprintf("Trying to create a third pod(pod3) with hostport %v, hostIP 127.0.0.2 but use UDP protocol on the node which pod2 resides", port))
+		creatHostPortPodOnNode(f, "pod3", ns, "127.0.0.2", port, v1.ProtocolUDP, nodeSelector, true)
+	})
+
+	It("validates that there exists conflict between pods with same hostPort and protocol but one using 0.0.0.0 hostIP", func() {
+		nodeName := GetNodeThatCanRunPod(f)
+
+		// use nodeSelector to make sure the testing pods get assigned on the same node to explicitly verify there exists conflict or not
+		By("Trying to apply a random label on the found node.")
+		k := fmt.Sprintf("kubernetes.io/e2e-%s", string(uuid.NewUUID()))
+		v := "95"
+
+		nodeSelector := make(map[string]string)
+		nodeSelector[k] = v
+
+		framework.AddOrUpdateLabelOnNode(cs, nodeName, k, v)
+		framework.ExpectNodeHasLabel(cs, nodeName, k, v)
+		defer framework.RemoveLabelOffNode(cs, nodeName, k)
+
+		port := int32(54322)
+		By(fmt.Sprintf("Trying to create a pod(pod4) with hostport %v and hostIP 0.0.0.0(empty string here) and expect scheduled", port))
+		creatHostPortPodOnNode(f, "pod4", ns, "", port, v1.ProtocolTCP, nodeSelector, true)
+
+		By(fmt.Sprintf("Trying to create another pod(pod5) with hostport %v but hostIP 127.0.0.1 on the node which pod4 resides and expect not scheduled", port))
+		creatHostPortPodOnNode(f, "pod5", ns, "127.0.0.1", port, v1.ProtocolTCP, nodeSelector, false)
 	})
 })
 
@@ -551,12 +659,13 @@ func initPausePod(f *framework.Framework, conf pausePodConfig) *v1.Pod {
 			Containers: []v1.Container{
 				{
 					Name:  conf.Name,
-					Image: framework.GetPauseImageName(f.ClientSet),
+					Image: imageutils.GetPauseImageName(),
 					Ports: conf.Ports,
 				},
 			},
-			Tolerations: conf.Tolerations,
-			NodeName:    conf.NodeName,
+			Tolerations:       conf.Tolerations,
+			NodeName:          conf.NodeName,
+			PriorityClassName: conf.PriorityClassName,
 		},
 	}
 	if conf.Resources != nil {
@@ -628,10 +737,10 @@ func createPausePodAction(f *framework.Framework, conf pausePodConfig) common.Ac
 
 // WaitForSchedulerAfterAction performs the provided action and then waits for
 // scheduler to act on the given pod.
-func WaitForSchedulerAfterAction(f *framework.Framework, action common.Action, podName string, expectSuccess bool) {
+func WaitForSchedulerAfterAction(f *framework.Framework, action common.Action, ns, podName string, expectSuccess bool) {
 	predicate := scheduleFailureEvent(podName)
 	if expectSuccess {
-		predicate = scheduleSuccessEvent(podName, "" /* any node */)
+		predicate = scheduleSuccessEvent(ns, podName, "" /* any node */)
 	}
 	success, err := common.ObserveEventAfterAction(f, predicate, action)
 	Expect(err).NotTo(HaveOccurred())
@@ -715,12 +824,33 @@ func CreateHostPortPods(f *framework.Framework, id string, replicas int, expectR
 		Name:           id,
 		Namespace:      f.Namespace.Name,
 		Timeout:        defaultTimeout,
-		Image:          framework.GetPauseImageName(f.ClientSet),
+		Image:          imageutils.GetPauseImageName(),
 		Replicas:       replicas,
 		HostPorts:      map[string]int{"port1": 4321},
 	}
 	err := framework.RunRC(*config)
 	if expectRunning {
+		framework.ExpectNoError(err)
+	}
+}
+
+// create pod which using hostport on the specified node according to the nodeSelector
+func creatHostPortPodOnNode(f *framework.Framework, podName, ns, hostIP string, port int32, protocol v1.Protocol, nodeSelector map[string]string, expectScheduled bool) {
+	createPausePod(f, pausePodConfig{
+		Name: podName,
+		Ports: []v1.ContainerPort{
+			{
+				HostPort:      port,
+				ContainerPort: 80,
+				Protocol:      protocol,
+				HostIP:        hostIP,
+			},
+		},
+		NodeSelector: nodeSelector,
+	})
+
+	err := framework.WaitForPodNotPending(f.ClientSet, ns, podName)
+	if expectScheduled {
 		framework.ExpectNoError(err)
 	}
 }

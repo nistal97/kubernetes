@@ -9,6 +9,7 @@ load(
 go_library(
     name = "go_default_library",
     srcs = ["admission.go"],
+    importpath = "k8s.io/sample-apiserver/pkg/admission/plugin/banflunder",
     deps = [
         "//vendor/k8s.io/apimachinery/pkg/api/errors:go_default_library",
         "//vendor/k8s.io/apimachinery/pkg/api/meta:go_default_library",
@@ -16,8 +17,8 @@ go_library(
         "//vendor/k8s.io/apiserver/pkg/admission:go_default_library",
         "//vendor/k8s.io/sample-apiserver/pkg/admission/wardleinitializer:go_default_library",
         "//vendor/k8s.io/sample-apiserver/pkg/apis/wardle:go_default_library",
-        "//vendor/k8s.io/sample-apiserver/pkg/client/informers_generated/internalversion:go_default_library",
-        "//vendor/k8s.io/sample-apiserver/pkg/client/listers_generated/wardle/internalversion:go_default_library",
+        "//vendor/k8s.io/sample-apiserver/pkg/client/informers/internalversion:go_default_library",
+        "//vendor/k8s.io/sample-apiserver/pkg/client/listers/wardle/internalversion:go_default_library",
     ],
 )
 
@@ -33,8 +34,8 @@ go_test(
         "//vendor/k8s.io/sample-apiserver/pkg/admission/plugin/banflunder:go_default_library",
         "//vendor/k8s.io/sample-apiserver/pkg/admission/wardleinitializer:go_default_library",
         "//vendor/k8s.io/sample-apiserver/pkg/apis/wardle:go_default_library",
-        "//vendor/k8s.io/sample-apiserver/pkg/client/clientset_generated/internalclientset/fake:go_default_library",
-        "//vendor/k8s.io/sample-apiserver/pkg/client/informers_generated/internalversion:go_default_library",
+        "//vendor/k8s.io/sample-apiserver/pkg/client/clientset/internalversion/fake:go_default_library",
+        "//vendor/k8s.io/sample-apiserver/pkg/client/informers/internalversion:go_default_library",
     ],
 )
 

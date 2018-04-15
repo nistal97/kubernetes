@@ -41,31 +41,30 @@ func TestPrintConfiguration(t *testing.T) {
 	api:
 	  advertiseAddress: ""
 	  bindPort: 0
-	apiServerCertSANs: null
-	apiServerExtraArgs: null
-	authorizationModes: null
+	  controlPlaneEndpoint: ""
+	auditPolicy:
+	  logDir: ""
+	  path: ""
 	certificatesDir: ""
 	cloudProvider: ""
-	controllerManagerExtraArgs: null
 	etcd:
 	  caFile: ""
 	  certFile: ""
 	  dataDir: ""
 	  endpoints: null
-	  extraArgs: null
 	  image: ""
 	  keyFile: ""
-	featureGates: null
 	imageRepository: ""
+	kubeProxy: {}
+	kubeletConfiguration: {}
 	kubernetesVersion: v1.7.1
 	networking:
 	  dnsDomain: ""
 	  podSubnet: ""
 	  serviceSubnet: ""
 	nodeName: ""
-	schedulerExtraArgs: null
+	privilegedPods: false
 	token: ""
-	tokenTTL: 0
 	unifiedControlPlaneImage: ""
 `),
 		},
@@ -80,31 +79,78 @@ func TestPrintConfiguration(t *testing.T) {
 	api:
 	  advertiseAddress: ""
 	  bindPort: 0
-	apiServerCertSANs: null
-	apiServerExtraArgs: null
-	authorizationModes: null
+	  controlPlaneEndpoint: ""
+	auditPolicy:
+	  logDir: ""
+	  path: ""
 	certificatesDir: ""
 	cloudProvider: ""
-	controllerManagerExtraArgs: null
 	etcd:
 	  caFile: ""
 	  certFile: ""
 	  dataDir: ""
 	  endpoints: null
-	  extraArgs: null
 	  image: ""
 	  keyFile: ""
-	featureGates: null
 	imageRepository: ""
+	kubeProxy: {}
+	kubeletConfiguration: {}
 	kubernetesVersion: v1.7.1
 	networking:
 	  dnsDomain: ""
 	  podSubnet: ""
 	  serviceSubnet: 10.96.0.1/12
 	nodeName: ""
-	schedulerExtraArgs: null
+	privilegedPods: false
 	token: ""
-	tokenTTL: 0
+	unifiedControlPlaneImage: ""
+`),
+		},
+		{
+			cfg: &kubeadmapiext.MasterConfiguration{
+				KubernetesVersion: "v1.7.1",
+				Etcd: kubeadmapiext.Etcd{
+					SelfHosted: &kubeadmapiext.SelfHostedEtcd{
+						CertificatesDir:    "/var/foo",
+						ClusterServiceName: "foo",
+						EtcdVersion:        "v0.1.0",
+						OperatorVersion:    "v0.1.0",
+					},
+				},
+			},
+			expectedBytes: []byte(`[upgrade/config] Configuration used:
+	api:
+	  advertiseAddress: ""
+	  bindPort: 0
+	  controlPlaneEndpoint: ""
+	auditPolicy:
+	  logDir: ""
+	  path: ""
+	certificatesDir: ""
+	cloudProvider: ""
+	etcd:
+	  caFile: ""
+	  certFile: ""
+	  dataDir: ""
+	  endpoints: null
+	  image: ""
+	  keyFile: ""
+	  selfHosted:
+	    certificatesDir: /var/foo
+	    clusterServiceName: foo
+	    etcdVersion: v0.1.0
+	    operatorVersion: v0.1.0
+	imageRepository: ""
+	kubeProxy: {}
+	kubeletConfiguration: {}
+	kubernetesVersion: v1.7.1
+	networking:
+	  dnsDomain: ""
+	  podSubnet: ""
+	  serviceSubnet: ""
+	nodeName: ""
+	privilegedPods: false
+	token: ""
 	unifiedControlPlaneImage: ""
 `),
 		},

@@ -58,8 +58,10 @@ func (s *referenceWalker) walkRef(ref spec.Ref) spec.Ref {
 	// We do not support external references yet.
 	if !s.alreadyVisited[refStr] && strings.HasPrefix(refStr, definitionPrefix) {
 		s.alreadyVisited[refStr] = true
-		def := s.root.Definitions[refStr[len(definitionPrefix):]]
+		k := refStr[len(definitionPrefix):]
+		def := s.root.Definitions[k]
 		s.walkSchema(&def)
+		s.root.Definitions[k] = def
 	}
 	return s.walkRefCallback(ref)
 }
@@ -69,23 +71,26 @@ func (s *referenceWalker) walkSchema(schema *spec.Schema) {
 		return
 	}
 	schema.Ref = s.walkRef(schema.Ref)
-	for _, v := range schema.Definitions {
+	for k, v := range schema.Definitions {
 		s.walkSchema(&v)
+		schema.Definitions[k] = v
 	}
-	for _, v := range schema.Properties {
+	for k, v := range schema.Properties {
 		s.walkSchema(&v)
+		schema.Properties[k] = v
 	}
-	for _, v := range schema.PatternProperties {
+	for k, v := range schema.PatternProperties {
 		s.walkSchema(&v)
+		schema.PatternProperties[k] = v
 	}
-	for _, v := range schema.AllOf {
-		s.walkSchema(&v)
+	for i, _ := range schema.AllOf {
+		s.walkSchema(&schema.AllOf[i])
 	}
-	for _, v := range schema.AnyOf {
-		s.walkSchema(&v)
+	for i, _ := range schema.AnyOf {
+		s.walkSchema(&schema.AnyOf[i])
 	}
-	for _, v := range schema.OneOf {
-		s.walkSchema(&v)
+	for i, _ := range schema.OneOf {
+		s.walkSchema(&schema.OneOf[i])
 	}
 	if schema.Not != nil {
 		s.walkSchema(schema.Not)
@@ -100,8 +105,8 @@ func (s *referenceWalker) walkSchema(schema *spec.Schema) {
 		if schema.Items.Schema != nil {
 			s.walkSchema(schema.Items.Schema)
 		}
-		for _, v := range schema.Items.Schemas {
-			s.walkSchema(&v)
+		for i, _ := range schema.Items.Schemas {
+			s.walkSchema(&schema.Items.Schemas[i])
 		}
 	}
 }
@@ -154,8 +159,28 @@ func (s *referenceWalker) Start() {
 	}
 }
 
-// FilterSpecByPaths remove unnecessary paths and unused definitions.
+// usedDefinitionForSpec returns a map with all used definition in the provided spec as keys and true as values.
+func usedDefinitionForSpec(sp *spec.Swagger) map[string]bool {
+	usedDefinitions := map[string]bool{}
+	walkOnAllReferences(func(ref spec.Ref) spec.Ref {
+		if refStr := ref.String(); refStr != "" && strings.HasPrefix(refStr, definitionPrefix) {
+			usedDefinitions[refStr[len(definitionPrefix):]] = true
+		}
+		return ref
+	}, sp)
+	return usedDefinitions
+}
+
+// FilterSpecByPaths removes unnecessary paths and definitions used by those paths.
+// i.e. if a Path removed by this function, all definition used by it and not used
+// anywhere else will also be removed.
 func FilterSpecByPaths(sp *spec.Swagger, keepPathPrefixes []string) {
+	// Walk all references to find all used definitions. This function
+	// want to only deal with unused definitions resulted from filtering paths.
+	// Thus a definition will be removed only if it has been used before but
+	// it is unused because of a path prune.
+	initialUsedDefinitions := usedDefinitionForSpec(sp)
+
 	// First remove unwanted paths
 	prefixes := util.NewTrie(keepPathPrefixes)
 	orgPaths := sp.Paths
@@ -174,34 +199,24 @@ func FilterSpecByPaths(sp *spec.Swagger, keepPathPrefixes []string) {
 	}
 
 	// Walk all references to find all definition references.
-	usedDefinitions := map[string]bool{}
-
-	walkOnAllReferences(func(ref spec.Ref) spec.Ref {
-		if ref.String() != "" {
-			refStr := ref.String()
-			if strings.HasPrefix(refStr, definitionPrefix) {
-				usedDefinitions[refStr[len(definitionPrefix):]] = true
-			}
-		}
-		return ref
-	}, sp)
+	usedDefinitions := usedDefinitionForSpec(sp)
 
 	// Remove unused definitions
 	orgDefinitions := sp.Definitions
 	sp.Definitions = spec.Definitions{}
 	for k, v := range orgDefinitions {
-		if usedDefinitions[k] {
+		if usedDefinitions[k] || !initialUsedDefinitions[k] {
 			sp.Definitions[k] = v
 		}
 	}
 }
 
 func renameDefinition(s *spec.Swagger, old, new string) {
-	old_ref := definitionPrefix + old
-	new_ref := definitionPrefix + new
+	oldRef := definitionPrefix + old
+	newRef := definitionPrefix + new
 	walkOnAllReferences(func(ref spec.Ref) spec.Ref {
-		if ref.String() == old_ref {
-			return spec.MustCreateRef(new_ref)
+		if ref.String() == oldRef {
+			return spec.MustCreateRef(newRef)
 		}
 		return ref
 	}, s)
@@ -209,58 +224,131 @@ func renameDefinition(s *spec.Swagger, old, new string) {
 	delete(s.Definitions, old)
 }
 
-// Copy paths and definitions from source to dest, rename definitions if needed.
-// dest will be mutated, and source will not be changed.
+// MergeSpecsIgnorePathConflict is the same as MergeSpecs except it will ignore any path
+// conflicts by keeping the paths of destination. It will rename definition conflicts.
+func MergeSpecsIgnorePathConflict(dest, source *spec.Swagger) error {
+	return mergeSpecs(dest, source, true, true)
+}
+
+// MergeSpecsFailOnDefinitionConflict is differ from MergeSpecs as it fails if there is
+// a definition conflict.
+func MergeSpecsFailOnDefinitionConflict(dest, source *spec.Swagger) error {
+	return mergeSpecs(dest, source, false, false)
+}
+
+// MergeSpecs copies paths and definitions from source to dest, rename definitions if needed.
+// dest will be mutated, and source will not be changed. It will fail on path conflicts.
 func MergeSpecs(dest, source *spec.Swagger) error {
-	sourceCopy, err := CloneSpec(source)
-	if err != nil {
-		return err
+	return mergeSpecs(dest, source, true, false)
+}
+
+func mergeSpecs(dest, source *spec.Swagger, renameModelConflicts, ignorePathConflicts bool) (err error) {
+	specCloned := false
+	if ignorePathConflicts {
+		keepPaths := []string{}
+		hasConflictingPath := false
+		for k := range source.Paths.Paths {
+			if _, found := dest.Paths.Paths[k]; !found {
+				keepPaths = append(keepPaths, k)
+			} else {
+				hasConflictingPath = true
+			}
+		}
+		if len(keepPaths) == 0 {
+			// There is nothing to merge. All paths are conflicting.
+			return nil
+		}
+		if hasConflictingPath {
+			source, err = CloneSpec(source)
+			if err != nil {
+				return err
+			}
+			specCloned = true
+			FilterSpecByPaths(source, keepPaths)
+		}
 	}
-	for k, v := range sourceCopy.Paths.Paths {
+	// Check for model conflicts
+	conflicts := false
+	for k, v := range source.Definitions {
+		v2, found := dest.Definitions[k]
+		if found && !reflect.DeepEqual(v, v2) {
+			if !renameModelConflicts {
+				return fmt.Errorf("model name conflict in merging OpenAPI spec: %s", k)
+			}
+			conflicts = true
+			break
+		}
+	}
+
+	if conflicts {
+		if !specCloned {
+			source, err = CloneSpec(source)
+			if err != nil {
+				return err
+			}
+		}
+		specCloned = true
+		usedNames := map[string]bool{}
+		for k := range dest.Definitions {
+			usedNames[k] = true
+		}
+		type Rename struct {
+			from, to string
+		}
+		renames := []Rename{}
+
+	OUTERLOOP:
+		for k, v := range source.Definitions {
+			if usedNames[k] {
+				v2, found := dest.Definitions[k]
+				// Reuse model if they are exactly the same.
+				if found && reflect.DeepEqual(v, v2) {
+					continue
+				}
+
+				// Reuse previously renamed model if one exists
+				var newName string
+				i := 1
+				for found {
+					i++
+					newName = fmt.Sprintf("%s_v%d", k, i)
+					v2, found = dest.Definitions[newName]
+					if found && reflect.DeepEqual(v, v2) {
+						renames = append(renames, Rename{from: k, to: newName})
+						continue OUTERLOOP
+					}
+				}
+
+				_, foundInSource := source.Definitions[newName]
+				for usedNames[newName] || foundInSource {
+					i++
+					newName = fmt.Sprintf("%s_v%d", k, i)
+					_, foundInSource = source.Definitions[newName]
+				}
+				renames = append(renames, Rename{from: k, to: newName})
+				usedNames[newName] = true
+			}
+		}
+		for _, r := range renames {
+			renameDefinition(source, r.from, r.to)
+		}
+	}
+	for k, v := range source.Definitions {
+		if _, found := dest.Definitions[k]; !found {
+			dest.Definitions[k] = v
+		}
+	}
+	// Check for path conflicts
+	for k, v := range source.Paths.Paths {
 		if _, found := dest.Paths.Paths[k]; found {
 			return fmt.Errorf("unable to merge: duplicated path %s", k)
 		}
 		dest.Paths.Paths[k] = v
 	}
-	usedNames := map[string]bool{}
-	for k := range dest.Definitions {
-		usedNames[k] = true
-	}
-	type Rename struct {
-		from, to string
-	}
-	renames := []Rename{}
-	for k, v := range sourceCopy.Definitions {
-		if usedNames[k] {
-			v2, found := dest.Definitions[k]
-			// Reuse model iff they are exactly the same.
-			if found && reflect.DeepEqual(v, v2) {
-				continue
-			}
-			i := 2
-			newName := fmt.Sprintf("%s_v%d", k, i)
-			_, foundInSource := sourceCopy.Definitions[newName]
-			for usedNames[newName] || foundInSource {
-				i += 1
-				newName = fmt.Sprintf("%s_v%d", k, i)
-				_, foundInSource = sourceCopy.Definitions[newName]
-			}
-			renames = append(renames, Rename{from: k, to: newName})
-			usedNames[newName] = true
-		}
-	}
-	for _, r := range renames {
-		renameDefinition(sourceCopy, r.from, r.to)
-	}
-	for k, v := range sourceCopy.Definitions {
-		if _, found := dest.Definitions[k]; !found {
-			dest.Definitions[k] = v
-		}
-	}
 	return nil
 }
 
-// Clone OpenAPI spec
+// CloneSpec clones OpenAPI spec
 func CloneSpec(source *spec.Swagger) (*spec.Swagger, error) {
 	// TODO(mehdy): Find a faster way to clone an spec
 	bytes, err := json.Marshal(source)

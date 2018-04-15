@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink/nl"
 	"github.com/vishvananda/netns"
 )
@@ -400,6 +400,13 @@ func (i *Handle) doGetServicesCmd(svc *Service) ([]*Service, error) {
 	}
 
 	return res, nil
+}
+
+// doCmdWithoutAttr a simple wrapper of netlink socket execute command
+func (i *Handle) doCmdWithoutAttr(cmd uint8) ([][]byte, error) {
+	req := newIPVSRequest(cmd)
+	req.Seq = atomic.AddUint32(&i.seq, 1)
+	return execute(i.sock, req, 0)
 }
 
 func assembleDestination(attrs []syscall.NetlinkRouteAttr) (*Destination, error) {

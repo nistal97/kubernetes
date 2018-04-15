@@ -23,19 +23,14 @@ import (
 	"github.com/docker/distribution/reference"
 	"github.com/spf13/cobra"
 
-	batchv1 "k8s.io/api/batch/v1"
-	batchv2alpha1 "k8s.io/api/batch/v2alpha1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/discovery"
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	coreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
-	conditions "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/kubectl"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
@@ -92,13 +87,13 @@ var (
 type RunObject struct {
 	Object  runtime.Object
 	Kind    string
-	Mapper  meta.RESTMapper
 	Mapping *meta.RESTMapping
 }
 
 func NewCmdRun(f cmdutil.Factory, cmdIn io.Reader, cmdOut, cmdErr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "run NAME --image=image [--env=\"key=value\"] [--port=port] [--replicas=replicas] [--dry-run=bool] [--overrides=inline-json] [--command] -- [COMMAND] [args...]",
+		Use: "run NAME --image=image [--env=\"key=value\"] [--port=port] [--replicas=replicas] [--dry-run=bool] [--overrides=inline-json] [--command] -- [COMMAND] [args...]",
+		DisableFlagsInUseLine: true,
 		Short:   i18n.T("Run a particular image on the cluster"),
 		Long:    runLong,
 		Example: runExample,
@@ -216,44 +211,32 @@ func RunRun(f cmdutil.Factory, cmdIn io.Reader, cmdOut, cmdErr io.Writer, cmd *c
 	if err != nil {
 		return err
 	}
-	resourcesList, err := clientset.Discovery().ServerResources()
-	// ServerResources ignores errors for old servers do not expose discovery
-	if err != nil {
-		return fmt.Errorf("failed to discover supported resources: %v", err)
-	}
 
 	generatorName := cmdutil.GetFlagString(cmd, "generator")
 	schedule := cmdutil.GetFlagString(cmd, "schedule")
 	if len(schedule) != 0 && len(generatorName) == 0 {
-		generatorName = cmdutil.CronJobV2Alpha1GeneratorName
+		generatorName = cmdutil.CronJobV1Beta1GeneratorName
 	}
 	if len(generatorName) == 0 {
 		switch restartPolicy {
 		case api.RestartPolicyAlways:
-			// TODO: we need to deprecate this along with extensions/v1beta1.Deployments
-			// in favor of the new generator for apps/v1beta1.Deployments
-			if contains(resourcesList, extensionsv1beta1.SchemeGroupVersion.WithResource("deployments")) {
-				generatorName = cmdutil.DeploymentV1Beta1GeneratorName
-			} else {
-				generatorName = cmdutil.RunV1GeneratorName
-			}
+			generatorName = cmdutil.DeploymentV1Beta1GeneratorName
 		case api.RestartPolicyOnFailure:
-			if contains(resourcesList, batchv1.SchemeGroupVersion.WithResource("jobs")) {
-				generatorName = cmdutil.JobV1GeneratorName
-			} else {
-				generatorName = cmdutil.RunPodV1GeneratorName
-			}
+			generatorName = cmdutil.JobV1GeneratorName
 		case api.RestartPolicyNever:
 			generatorName = cmdutil.RunPodV1GeneratorName
 		}
-	}
 
-	// TODO: this should be removed alongside with extensions/v1beta1 depployments generator
-	generatorName = fallbackGeneratorNameIfNecessary(generatorName, resourcesList, cmdErr)
-
-	if generatorName == cmdutil.CronJobV2Alpha1GeneratorName &&
-		!contains(resourcesList, batchv2alpha1.SchemeGroupVersion.WithResource("cronjobs")) {
-		return fmt.Errorf("CronJob generator specified, but batch/v2alpha1.CronJobs are not available")
+		// Falling back because the generator was not provided and the default one could be unavailable.
+		generatorNameTemp, err := cmdutil.FallbackGeneratorNameIfNecessary(generatorName, clientset.Discovery(), cmdErr)
+		if err != nil {
+			return err
+		}
+		if generatorNameTemp != generatorName {
+			cmdutil.Warning(cmdErr, generatorName, generatorNameTemp)
+		} else {
+			generatorName = generatorNameTemp
+		}
 	}
 
 	generators := f.Generators("run")
@@ -270,13 +253,14 @@ func RunRun(f cmdutil.Factory, cmdIn io.Reader, cmdOut, cmdErr io.Writer, cmd *c
 
 	params["env"] = cmdutil.GetFlagStringArray(cmd, "env")
 
-	var runObjectMap = map[string]*RunObject{}
+	var createdObjects = []*RunObject{}
 	runObject, err := createGeneratedObject(f, cmd, generator, names, params, cmdutil.GetFlagString(cmd, "overrides"), namespace)
 	if err != nil {
 		return err
+	} else {
+		createdObjects = append(createdObjects, runObject)
 	}
-	runObjectMap[generatorName] = runObject
-
+	allErrs := []error{}
 	if cmdutil.GetFlagBool(cmd, "expose") {
 		serviceGenerator := cmdutil.GetFlagString(cmd, "service-generator")
 		if len(serviceGenerator) == 0 {
@@ -284,12 +268,17 @@ func RunRun(f cmdutil.Factory, cmdIn io.Reader, cmdOut, cmdErr io.Writer, cmd *c
 		}
 		serviceRunObject, err := generateService(f, cmd, args, serviceGenerator, params, namespace, cmdOut)
 		if err != nil {
-			return err
+			allErrs = append(allErrs, err)
+		} else {
+			createdObjects = append(createdObjects, serviceRunObject)
 		}
-		runObjectMap[generatorName] = serviceRunObject
 	}
 
 	if attach {
+		if remove {
+			defer removeCreatedObjects(f, createdObjects, cmdOut)
+		}
+
 		quiet := cmdutil.GetFlagBool(cmd, "quiet")
 		opts := &AttachOptions{
 			StreamOptions: StreamOptions{
@@ -330,39 +319,9 @@ func RunRun(f cmdutil.Factory, cmdIn io.Reader, cmdOut, cmdErr io.Writer, cmd *c
 		leaveStdinOpen := cmdutil.GetFlagBool(cmd, "leave-stdin-open")
 		waitForExitCode := !leaveStdinOpen && restartPolicy == api.RestartPolicyNever
 		if waitForExitCode {
-			pod, err = waitForPodTerminated(clientset.Core(), attachablePod.Namespace, attachablePod.Name)
+			pod, err = waitForPod(clientset.Core(), attachablePod.Namespace, attachablePod.Name, kubectl.PodCompleted)
 			if err != nil {
 				return err
-			}
-		}
-
-		if remove {
-			for _, obj := range runObjectMap {
-				namespace, err = obj.Mapping.MetadataAccessor.Namespace(obj.Object)
-				if err != nil {
-					return err
-				}
-				var name string
-				name, err = obj.Mapping.MetadataAccessor.Name(obj.Object)
-				if err != nil {
-					return err
-				}
-				r := f.NewBuilder(true).
-					ContinueOnError().
-					NamespaceParam(namespace).DefaultNamespace().
-					ResourceNames(obj.Mapping.Resource, name).
-					Flatten().
-					Do()
-				// Note: we pass in "true" for the "quiet" parameter because
-				// ReadResult will only print one thing based on the "quiet"
-				// flag, and that's the "pod xxx deleted" message. If they
-				// asked for us to remove the pod (via --rm) then telling them
-				// its been deleted is unnecessary since that's what they asked
-				// for. We should only print something if the "rm" fails.
-				err = ReapResult(r, f, cmdOut, true, true, 0, -1, false, false, obj.Mapper, true)
-				if err != nil {
-					return err
-				}
 			}
 		}
 
@@ -393,21 +352,48 @@ func RunRun(f cmdutil.Factory, cmdIn io.Reader, cmdOut, cmdErr io.Writer, cmd *c
 		}
 
 	}
-
-	outputFormat := cmdutil.GetFlagString(cmd, "output")
-	if outputFormat != "" || cmdutil.GetDryRunFlag(cmd) {
-		return f.PrintObject(cmd, false, runObject.Mapper, runObject.Object, cmdOut)
+	if runObject != nil {
+		outputFormat := cmdutil.GetFlagString(cmd, "output")
+		if outputFormat != "" || cmdutil.GetDryRunFlag(cmd) {
+			return cmdutil.PrintObject(cmd, runObject.Object, cmdOut)
+		}
+		cmdutil.PrintSuccess(false, cmdOut, runObject.Object, cmdutil.GetDryRunFlag(cmd), "created")
 	}
-	cmdutil.PrintSuccess(runObject.Mapper, false, cmdOut, runObject.Mapping.Resource, args[0], cmdutil.GetDryRunFlag(cmd), "created")
-	return nil
+
+	return utilerrors.NewAggregate(allErrs)
 }
 
-// TODO turn this into reusable method checking available resources
-func contains(resourcesList []*metav1.APIResourceList, resource schema.GroupVersionResource) bool {
-	resources := discovery.FilteredBy(discovery.ResourcePredicateFunc(func(gv string, r *metav1.APIResource) bool {
-		return resource.GroupVersion().String() == gv && resource.Resource == r.Name
-	}), resourcesList)
-	return len(resources) != 0
+func removeCreatedObjects(f cmdutil.Factory, createdObjects []*RunObject, cmdOut io.Writer) error {
+	for _, obj := range createdObjects {
+		namespace, err := obj.Mapping.MetadataAccessor.Namespace(obj.Object)
+		if err != nil {
+			return err
+		}
+		var name string
+		name, err = obj.Mapping.MetadataAccessor.Name(obj.Object)
+		if err != nil {
+			return err
+		}
+		r := f.NewBuilder().
+			Internal().
+			ContinueOnError().
+			NamespaceParam(namespace).DefaultNamespace().
+			ResourceNames(obj.Mapping.Resource, name).
+			Flatten().
+			Do()
+		// Note: we pass in "true" for the "quiet" parameter because
+		// ReadResult will only print one thing based on the "quiet"
+		// flag, and that's the "pod xxx deleted" message. If they
+		// asked for us to remove the pod (via --rm) then telling them
+		// its been deleted is unnecessary since that's what they asked
+		// for. We should only print something if the "rm" fails.
+		err = ReapResult(r, f, cmdOut, true, true, 0, -1, false, false, true)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // waitForPod watches the given pod until the exitCondition is true
@@ -428,34 +414,18 @@ func waitForPod(podClient coreclient.PodsGetter, ns, name string, exitCondition 
 		}
 		return err
 	})
+
+	// Fix generic not found error.
+	if err != nil && errors.IsNotFound(err) {
+		err = errors.NewNotFound(api.Resource("pods"), name)
+	}
+
 	return result, err
 }
 
-func waitForPodRunning(podClient coreclient.PodsGetter, ns, name string) (*api.Pod, error) {
-	pod, err := waitForPod(podClient, ns, name, conditions.PodRunningAndReady)
-
-	// fix generic not found error with empty name in PodRunningAndReady
-	if err != nil && errors.IsNotFound(err) {
-		return nil, errors.NewNotFound(api.Resource("pods"), name)
-	}
-
-	return pod, err
-}
-
-func waitForPodTerminated(podClient coreclient.PodsGetter, ns, name string) (*api.Pod, error) {
-	pod, err := waitForPod(podClient, ns, name, conditions.PodCompleted)
-
-	// fix generic not found error with empty name in PodCompleted
-	if err != nil && errors.IsNotFound(err) {
-		return nil, errors.NewNotFound(api.Resource("pods"), name)
-	}
-
-	return pod, err
-}
-
 func handleAttachPod(f cmdutil.Factory, podClient coreclient.PodsGetter, ns, name string, opts *AttachOptions) error {
-	pod, err := waitForPodRunning(podClient, ns, name)
-	if err != nil && err != conditions.ErrPodCompleted {
+	pod, err := waitForPod(podClient, ns, name, kubectl.PodRunningAndReady)
+	if err != nil && err != kubectl.ErrPodCompleted {
 		return err
 	}
 
@@ -518,7 +488,7 @@ func getRestartPolicy(cmd *cobra.Command, interactive bool) (api.RestartPolicy, 
 	case api.RestartPolicyNever:
 		return api.RestartPolicyNever, nil
 	}
-	return "", cmdutil.UsageErrorf(cmd, "invalid restart policy: %s")
+	return "", cmdutil.UsageErrorf(cmd, "invalid restart policy: %s", restart)
 }
 
 func verifyImagePullPolicy(cmd *cobra.Command) error {
@@ -568,7 +538,7 @@ func generateService(f cmdutil.Factory, cmd *cobra.Command, args []string, servi
 	}
 
 	if cmdutil.GetFlagString(cmd, "output") != "" || cmdutil.GetDryRunFlag(cmd) {
-		err := f.PrintObject(cmd, false, runObject.Mapper, runObject.Object, out)
+		err := cmdutil.PrintObject(cmd, runObject.Object, out)
 		if err != nil {
 			return nil, err
 		}
@@ -577,7 +547,7 @@ func generateService(f cmdutil.Factory, cmd *cobra.Command, args []string, servi
 		}
 		return runObject, nil
 	}
-	cmdutil.PrintSuccess(runObject.Mapper, false, out, runObject.Mapping.Resource, args[0], cmdutil.GetDryRunFlag(cmd), "created")
+	cmdutil.PrintSuccess(false, out, runObject.Object, cmdutil.GetDryRunFlag(cmd), "created")
 
 	return runObject, nil
 }
@@ -602,7 +572,7 @@ func createGeneratedObject(f cmdutil.Factory, cmd *cobra.Command, generator kube
 	groupVersionKind := groupVersionKinds[0]
 
 	if len(overrides) > 0 {
-		codec := runtime.NewCodec(f.JSONEncoder(), f.Decoder(true))
+		codec := runtime.NewCodec(cmdutil.InternalVersionJSONEncoder(), cmdutil.InternalVersionDecoder())
 		obj, err = cmdutil.Merge(codec, obj, overrides)
 		if err != nil {
 			return nil, err
@@ -632,14 +602,14 @@ func createGeneratedObject(f cmdutil.Factory, cmd *cobra.Command, generator kube
 			ObjectTyper:  typer,
 			RESTMapper:   mapper,
 			ClientMapper: resource.ClientMapperFunc(f.ClientForMapping),
-			Decoder:      f.Decoder(true),
+			Decoder:      cmdutil.InternalVersionDecoder(),
 		}
 		info, err := resourceMapper.InfoForObject(obj, nil)
 		if err != nil {
 			return nil, err
 		}
 
-		if err := kubectl.CreateOrUpdateAnnotation(cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag), info, f.JSONEncoder()); err != nil {
+		if err := kubectl.CreateOrUpdateAnnotation(cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag), info, cmdutil.InternalVersionJSONEncoder()); err != nil {
 			return nil, err
 		}
 
@@ -651,7 +621,6 @@ func createGeneratedObject(f cmdutil.Factory, cmd *cobra.Command, generator kube
 	return &RunObject{
 		Object:  obj,
 		Kind:    groupVersionKind.Kind,
-		Mapper:  mapper,
 		Mapping: mapping,
 	}, nil
 }

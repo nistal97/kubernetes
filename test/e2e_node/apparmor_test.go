@@ -50,7 +50,7 @@ var _ = framework.KubeDescribe("AppArmor [Feature:AppArmor]", func() {
 			f := framework.NewDefaultFramework("apparmor-test")
 
 			It("should reject an unloaded profile", func() {
-				status := runAppArmorTest(f, false, apparmor.ProfileNamePrefix+"non-existant-profile")
+				status := runAppArmorTest(f, false, apparmor.ProfileNamePrefix+"non-existent-profile")
 				expectSoftRejection(status)
 			})
 			It("should enforce a profile blocking writes", func() {
@@ -182,7 +182,7 @@ func createPodWithAppArmor(f *framework.Framework, profile string) *v1.Pod {
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{{
 				Name:    "test",
-				Image:   "gcr.io/google_containers/busybox:1.24",
+				Image:   busyboxImage,
 				Command: []string{"touch", "foo"},
 			}},
 			RestartPolicy: v1.RestartPolicyNever,

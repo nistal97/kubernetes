@@ -17,6 +17,7 @@ limitations under the License.
 package gce
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	computealpha "google.golang.org/api/compute/v0.alpha"
 	computebeta "google.golang.org/api/compute/v0.beta"
 	computev1 "google.golang.org/api/compute/v1"
+	"k8s.io/kubernetes/pkg/cloudprovider"
 )
 
 func TestReadConfigFile(t *testing.T) {
@@ -99,7 +101,7 @@ func TestGetRegion(t *testing.T) {
 	if !ok {
 		t.Fatalf("Unexpected missing zones impl")
 	}
-	zone, err := zones.GetZone()
+	zone, err := zones.GetZone(context.TODO())
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
@@ -170,42 +172,6 @@ func TestComparingHostURLs(t *testing.T) {
 			t.Errorf("expected link1 and link2 to be equal, got %s and %s", link1, link2)
 		} else if !test.expectEqual && link1 == link2 {
 			t.Errorf("expected link1 and link2 not to be equal, got %s and %s", link1, link2)
-		}
-	}
-}
-
-func TestScrubDNS(t *testing.T) {
-	tcs := []struct {
-		nameserversIn  []string
-		searchesIn     []string
-		nameserversOut []string
-		searchesOut    []string
-	}{
-		{
-			nameserversIn:  []string{"1.2.3.4", "5.6.7.8"},
-			nameserversOut: []string{"1.2.3.4", "5.6.7.8"},
-		},
-		{
-			searchesIn:  []string{"c.prj.internal.", "12345678910.google.internal.", "google.internal."},
-			searchesOut: []string{"c.prj.internal.", "google.internal."},
-		},
-		{
-			searchesIn:  []string{"c.prj.internal.", "12345678910.google.internal.", "zone.c.prj.internal.", "google.internal."},
-			searchesOut: []string{"c.prj.internal.", "zone.c.prj.internal.", "google.internal."},
-		},
-		{
-			searchesIn:  []string{"c.prj.internal.", "12345678910.google.internal.", "zone.c.prj.internal.", "google.internal.", "unexpected"},
-			searchesOut: []string{"c.prj.internal.", "zone.c.prj.internal.", "google.internal.", "unexpected"},
-		},
-	}
-	gce := &GCECloud{}
-	for i := range tcs {
-		n, s := gce.ScrubDNS(tcs[i].nameserversIn, tcs[i].searchesIn)
-		if !reflect.DeepEqual(n, tcs[i].nameserversOut) {
-			t.Errorf("Expected %v, got %v", tcs[i].nameserversOut, n)
-		}
-		if !reflect.DeepEqual(s, tcs[i].searchesOut) {
-			t.Errorf("Expected %v, got %v", tcs[i].searchesOut, s)
 		}
 	}
 }
@@ -281,7 +247,7 @@ func TestSplitProviderID(t *testing.T) {
 	for _, test := range providers {
 		project, zone, instance, err := splitProviderID(test.providerID)
 		if (err != nil) != test.fail {
-			t.Errorf("Expected to failt=%t, with pattern %v", test.fail, test)
+			t.Errorf("Expected to fail=%t, with pattern %v", test.fail, test)
 		}
 
 		if test.fail {
@@ -296,6 +262,61 @@ func TestSplitProviderID(t *testing.T) {
 		}
 		if instance != test.instance {
 			t.Errorf("Expected %v, but got %v", test.instance, instance)
+		}
+	}
+}
+
+func TestGetZoneByProviderID(t *testing.T) {
+	tests := []struct {
+		providerID string
+
+		expectedZone cloudprovider.Zone
+
+		fail        bool
+		description string
+	}{
+		{
+			providerID:   ProviderName + "://project-example-164317/us-central1-f/kubernetes-node-fhx1",
+			expectedZone: cloudprovider.Zone{FailureDomain: "us-central1-f", Region: "us-central1"},
+			fail:         false,
+			description:  "standard gce providerID",
+		},
+		{
+			providerID:   ProviderName + "://project-example-164317/us-central1-f/kubernetes-node-fhx1/",
+			expectedZone: cloudprovider.Zone{},
+			fail:         true,
+			description:  "too many slashes('/') trailing",
+		},
+		{
+			providerID:   ProviderName + "://project-example.164317//kubernetes-node-fhx1",
+			expectedZone: cloudprovider.Zone{},
+			fail:         true,
+			description:  "too many slashes('/') embedded",
+		},
+		{
+			providerID:   ProviderName + "://project-example-164317/uscentral1f/kubernetes-node-fhx1",
+			expectedZone: cloudprovider.Zone{},
+			fail:         true,
+			description:  "invalid name of the GCE zone",
+		},
+	}
+
+	gce := &GCECloud{
+		localZone: "us-central1-f",
+		region:    "us-central1",
+	}
+	for _, test := range tests {
+		zone, err := gce.GetZoneByProviderID(context.TODO(), test.providerID)
+		if (err != nil) != test.fail {
+			t.Errorf("Expected to fail=%t, provider ID %v, tests %s", test.fail, test, test.description)
+		}
+
+		if test.fail {
+			continue
+		}
+
+		if zone != test.expectedZone {
+			t.Errorf("Expected %v, but got %v", test.expectedZone, zone)
 		}
 	}
 }
@@ -510,51 +531,39 @@ func getTestOperation() *computev1.Operation {
 }
 
 func TestNewAlphaFeatureGate(t *testing.T) {
-	knownAlphaFeatures["foo"] = true
-	knownAlphaFeatures["bar"] = true
-
 	testCases := []struct {
 		alphaFeatures  []string
 		expectEnabled  []string
 		expectDisabled []string
-		expectError    bool
 	}{
 		// enable foo bar
 		{
 			alphaFeatures:  []string{"foo", "bar"},
 			expectEnabled:  []string{"foo", "bar"},
 			expectDisabled: []string{"aaa"},
-			expectError:    false,
 		},
 		// no alpha feature
 		{
 			alphaFeatures:  []string{},
 			expectEnabled:  []string{},
 			expectDisabled: []string{"foo", "bar"},
-			expectError:    false,
 		},
 		// unsupported alpha feature
 		{
 			alphaFeatures:  []string{"aaa", "foo"},
-			expectError:    true,
 			expectEnabled:  []string{"foo"},
-			expectDisabled: []string{"aaa"},
+			expectDisabled: []string{},
 		},
 		// enable foo
 		{
 			alphaFeatures:  []string{"foo"},
 			expectEnabled:  []string{"foo"},
 			expectDisabled: []string{"bar"},
-			expectError:    false,
 		},
 	}
 
 	for _, tc := range testCases {
-		featureGate, err := NewAlphaFeatureGate(tc.alphaFeatures)
-
-		if (tc.expectError && err == nil) || (!tc.expectError && err != nil) {
-			t.Errorf("Expect error to be %v, but got error %v", tc.expectError, err)
-		}
+		featureGate := NewAlphaFeatureGate(tc.alphaFeatures)
 
 		for _, key := range tc.expectEnabled {
 			if !featureGate.Enabled(key) {
@@ -567,6 +576,64 @@ func TestNewAlphaFeatureGate(t *testing.T) {
 			}
 		}
 	}
-	delete(knownAlphaFeatures, "foo")
-	delete(knownAlphaFeatures, "bar")
+}
+
+func TestGetRegionInURL(t *testing.T) {
+	cases := map[string]string{
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-central1/subnetworks/a": "us-central1",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-west2/subnetworks/b":    "us-west2",
+		"projects/my-project/regions/asia-central1/subnetworks/c":                                     "asia-central1",
+		"regions/europe-north2":                                                                       "europe-north2",
+		"my-url":                                                                                      "",
+		"":                                                                                            "",
+	}
+	for input, output := range cases {
+		result := getRegionInURL(input)
+		if result != output {
+			t.Errorf("Actual result %q does not match expected result %q for input: %q", result, output, input)
+		}
+	}
+}
+
+func TestFindSubnetForRegion(t *testing.T) {
+	s := []string{
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-central1/subnetworks/default-38b01f54907a15a7",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-west1/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-east1/subnetworks/default-277eec3815f742b6",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-east4/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/asia-northeast1/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/asia-east1/subnetworks/default-8e020b4b8b244809",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/australia-southeast1/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/southamerica-east1/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/europe-west3/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/asia-southeast1/subnetworks/default",
+		"",
+	}
+	actual := findSubnetForRegion(s, "asia-east1")
+	expectedResult := "https://www.googleapis.com/compute/v1/projects/my-project/regions/asia-east1/subnetworks/default-8e020b4b8b244809"
+	if actual != expectedResult {
+		t.Errorf("Actual result %q does not match expected result %q", actual, expectedResult)
+	}
+
+	var nilSlice []string
+	res := findSubnetForRegion(nilSlice, "us-central1")
+	if res != "" {
+		t.Errorf("expected an empty result, got %v", res)
+	}
+}
+
+func TestLastComponent(t *testing.T) {
+	cases := map[string]string{
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-central1/subnetworks/a": "a",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-central1/subnetworks/b": "b",
+		"projects/my-project/regions/us-central1/subnetworks/c":                                       "c",
+		"d": "d",
+		"":  "",
+	}
+	for input, output := range cases {
+		result := lastComponent(input)
+		if result != output {
+			t.Errorf("Actual result %q does not match expected result %q for input: %q", result, output, input)
+		}
+	}
 }

@@ -50,7 +50,7 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 			for i := 0; i < tobj.NumField(); i++ {
 				field := tobj.Field(i)
 				switch field.Name {
-				case "Default", "Enum", "Example":
+				case "Default", "Enum", "Example", "Ref":
 					continue
 				default:
 					isValue := true
@@ -58,7 +58,7 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 					case reflect.Interface, reflect.Map, reflect.Slice, reflect.Ptr:
 						isValue = false
 					}
-					if isValue || c.Intn(5) == 0 {
+					if isValue || c.Intn(10) == 0 {
 						c.Fuzz(vobj.Field(i).Addr().Interface())
 					}
 				}
@@ -74,9 +74,14 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 				validJSON := apiextensions.JSON(`"foobarbaz"`)
 				obj.Example = &validJSON
 			}
+			if c.RandBool() {
+				validRef := "validRef"
+				obj.Ref = &validRef
+			}
 		},
 		func(obj *apiextensions.JSONSchemaPropsOrBool, c fuzz.Continue) {
 			if c.RandBool() {
+				obj.Allows = true
 				obj.Schema = &apiextensions.JSONSchemaProps{}
 				c.Fuzz(obj.Schema)
 			} else {

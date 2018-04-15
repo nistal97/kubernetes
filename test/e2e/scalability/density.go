@@ -32,24 +32,27 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/sets"
 	utiluuid "k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
+	scaleclient "k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/apis/batch"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/extensions"
 	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/kubernetes/test/e2e/framework/timer"
 	testutils "k8s.io/kubernetes/test/utils"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
 const (
+	PodStartupLatencyThreshold = 5 * time.Second
 	MinSaturationThreshold     = 2 * time.Minute
 	MinPodsPerSecondThroughput = 8
 	DensityPollInterval        = 10 * time.Second
@@ -58,10 +61,14 @@ const (
 // Maximum container failures this test tolerates before failing.
 var MaxContainerFailures = 0
 
+// Maximum no. of missing measurements related to pod-startup that the test tolerates.
+var MaxMissingPodStartupMeasurements = 0
+
 type DensityTestConfig struct {
 	Configs            []testutils.RunObjectConfig
 	ClientSets         []clientset.Interface
 	InternalClientsets []internalclientset.Interface
+	ScaleClients       []scaleclient.ScalesGetter
 	PollInterval       time.Duration
 	PodCount           int
 	// What kind of resource we want to create
@@ -69,6 +76,55 @@ type DensityTestConfig struct {
 	SecretConfigs    []*testutils.SecretConfig
 	ConfigMapConfigs []*testutils.ConfigMapConfig
 	DaemonConfigs    []*testutils.DaemonConfig
+}
+
+func (dtc *DensityTestConfig) runSecretConfigs(testPhase *timer.Phase) {
+	defer testPhase.End()
+	for _, sc := range dtc.SecretConfigs {
+		sc.Run()
+	}
+}
+
+func (dtc *DensityTestConfig) runConfigMapConfigs(testPhase *timer.Phase) {
+	defer testPhase.End()
+	for _, cmc := range dtc.ConfigMapConfigs {
+		cmc.Run()
+	}
+}
+
+func (dtc *DensityTestConfig) runDaemonConfigs(testPhase *timer.Phase) {
+	defer testPhase.End()
+	for _, dc := range dtc.DaemonConfigs {
+		dc.Run()
+	}
+}
+
+func (dtc *DensityTestConfig) deleteSecrets(testPhase *timer.Phase) {
+	defer testPhase.End()
+	for i := range dtc.SecretConfigs {
+		dtc.SecretConfigs[i].Stop()
+	}
+}
+
+func (dtc *DensityTestConfig) deleteConfigMaps(testPhase *timer.Phase) {
+	defer testPhase.End()
+	for i := range dtc.ConfigMapConfigs {
+		dtc.ConfigMapConfigs[i].Stop()
+	}
+}
+
+func (dtc *DensityTestConfig) deleteDaemonSets(numberOfClients int, testPhase *timer.Phase) {
+	defer testPhase.End()
+	for i := range dtc.DaemonConfigs {
+		framework.ExpectNoError(framework.DeleteResourceAndPods(
+			dtc.ClientSets[i%numberOfClients],
+			dtc.InternalClientsets[i%numberOfClients],
+			dtc.ScaleClients[i%numberOfClients],
+			extensions.Kind("DaemonSet"),
+			dtc.DaemonConfigs[i].Namespace,
+			dtc.DaemonConfigs[i].Name,
+		))
+	}
 }
 
 func density30AddonResourceVerifier(numNodes int) map[string]framework.ResourceConstraint {
@@ -81,7 +137,7 @@ func density30AddonResourceVerifier(numNodes int) map[string]framework.ResourceC
 	controllerMem = math.MaxUint64
 	schedulerCPU := math.MaxFloat32
 	schedulerMem = math.MaxUint64
-	framework.Logf("Setting resource constraings for provider: %s", framework.TestContext.Provider)
+	framework.Logf("Setting resource constraints for provider: %s", framework.TestContext.Provider)
 	if framework.ProviderIs("kubemark") {
 		if numNodes <= 5 {
 			apiserverCPU = 0.35
@@ -115,9 +171,9 @@ func density30AddonResourceVerifier(numNodes int) map[string]framework.ResourceC
 	} else {
 		if numNodes <= 100 {
 			apiserverCPU = 1.8
-			apiserverMem = 1500 * (1024 * 1024)
-			controllerCPU = 0.5
-			controllerMem = 500 * (1024 * 1024)
+			apiserverMem = 1700 * (1024 * 1024)
+			controllerCPU = 0.6
+			controllerMem = 530 * (1024 * 1024)
 			schedulerCPU = 0.4
 			schedulerMem = 180 * (1024 * 1024)
 		}
@@ -146,8 +202,8 @@ func density30AddonResourceVerifier(numNodes int) map[string]framework.ResourceC
 		MemoryConstraint: 100 * (1024 * 1024),
 	}
 	constraints["l7-lb-controller"] = framework.ResourceConstraint{
-		CPUConstraint:    0.15,
-		MemoryConstraint: (75 + uint64(math.Ceil(0.6*float64(numNodes)))) * (1024 * 1024),
+		CPUConstraint:    0.2 + 0.00015*float64(numNodes),
+		MemoryConstraint: (75 + uint64(math.Ceil(0.8*float64(numNodes)))) * (1024 * 1024),
 	}
 	constraints["influxdb"] = framework.ResourceConstraint{
 		CPUConstraint:    2,
@@ -170,8 +226,10 @@ func density30AddonResourceVerifier(numNodes int) map[string]framework.ResourceC
 
 func logPodStartupStatus(c clientset.Interface, expectedPods int, observedLabels map[string]string, period time.Duration, stopCh chan struct{}) {
 	label := labels.SelectorFromSet(labels.Set(observedLabels))
-	podStore := testutils.NewPodStore(c, metav1.NamespaceAll, label, fields.Everything())
+	podStore, err := testutils.NewPodStore(c, metav1.NamespaceAll, label, fields.Everything())
+	framework.ExpectNoError(err)
 	defer podStore.Stop()
+
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 	for {
@@ -191,20 +249,16 @@ func logPodStartupStatus(c clientset.Interface, expectedPods int, observedLabels
 
 // runDensityTest will perform a density test and return the time it took for
 // all pods to start
-func runDensityTest(dtc DensityTestConfig) time.Duration {
+func runDensityTest(dtc DensityTestConfig, testPhaseDurations *timer.TestPhaseTimer) time.Duration {
 	defer GinkgoRecover()
 
 	// Create all secrets, configmaps and daemons.
-	for i := range dtc.SecretConfigs {
-		dtc.SecretConfigs[i].Run()
-	}
-	for i := range dtc.ConfigMapConfigs {
-		dtc.ConfigMapConfigs[i].Run()
-	}
-	for i := range dtc.DaemonConfigs {
-		dtc.DaemonConfigs[i].Run()
-	}
+	dtc.runSecretConfigs(testPhaseDurations.StartPhase(250, "secrets creation"))
+	dtc.runConfigMapConfigs(testPhaseDurations.StartPhase(260, "configmaps creation"))
+	dtc.runDaemonConfigs(testPhaseDurations.StartPhase(270, "daemonsets creation"))
 
+	replicationCtrlStartupPhase := testPhaseDurations.StartPhase(300, "saturation pods creation")
+	defer replicationCtrlStartupPhase.End()
 	// Start all replication controllers.
 	startTime := time.Now()
 	wg := sync.WaitGroup{}
@@ -226,10 +280,13 @@ func runDensityTest(dtc DensityTestConfig) time.Duration {
 	close(logStopCh)
 	framework.Logf("E2E startup time for %d pods: %v", dtc.PodCount, startupTime)
 	framework.Logf("Throughput (pods/s) during cluster saturation phase: %v", float32(dtc.PodCount)/float32(startupTime/time.Second))
+	replicationCtrlStartupPhase.End()
 
+	printPodAllocationPhase := testPhaseDurations.StartPhase(400, "printing pod allocation")
+	defer printPodAllocationPhase.End()
 	// Print some data about Pod to Node allocation
 	By("Printing Pod to Node allocation data")
-	podList, err := dtc.ClientSets[0].Core().Pods(metav1.NamespaceAll).List(metav1.ListOptions{})
+	podList, err := dtc.ClientSets[0].CoreV1().Pods(metav1.NamespaceAll).List(metav1.ListOptions{})
 	framework.ExpectNoError(err)
 	pausePodAllocation := make(map[string]int)
 	systemPodAllocation := make(map[string][]string)
@@ -248,11 +305,14 @@ func runDensityTest(dtc DensityTestConfig) time.Duration {
 	for _, node := range nodeNames {
 		framework.Logf("%v: %v pause pods, system pods: %v", node, pausePodAllocation[node], systemPodAllocation[node])
 	}
+	defer printPodAllocationPhase.End()
 	return startupTime
 }
 
-func cleanupDensityTest(dtc DensityTestConfig) {
+func cleanupDensityTest(dtc DensityTestConfig, testPhaseDurations *timer.TestPhaseTimer) {
 	defer GinkgoRecover()
+	podCleanupPhase := testPhaseDurations.StartPhase(900, "latency pods deletion")
+	defer podCleanupPhase.End()
 	By("Deleting created Collections")
 	numberOfClients := len(dtc.ClientSets)
 	// We explicitly delete all pods to have API calls necessary for deletion accounted in metrics.
@@ -266,27 +326,15 @@ func cleanupDensityTest(dtc DensityTestConfig) {
 			framework.ExpectNoError(err)
 		} else {
 			By(fmt.Sprintf("Cleaning up the %v and pods", kind))
-			err := framework.DeleteResourceAndPods(dtc.ClientSets[i%numberOfClients], dtc.InternalClientsets[i%numberOfClients], kind, namespace, name)
+			err := framework.DeleteResourceAndPods(dtc.ClientSets[i%numberOfClients], dtc.InternalClientsets[i%numberOfClients], dtc.ScaleClients[i%numberOfClients], kind, namespace, name)
 			framework.ExpectNoError(err)
 		}
 	}
+	podCleanupPhase.End()
 
-	// Delete all secrets, configmaps and daemons.
-	for i := range dtc.SecretConfigs {
-		dtc.SecretConfigs[i].Stop()
-	}
-	for i := range dtc.ConfigMapConfigs {
-		dtc.ConfigMapConfigs[i].Stop()
-	}
-	for i := range dtc.DaemonConfigs {
-		framework.ExpectNoError(framework.DeleteResourceAndPods(
-			dtc.ClientSets[i%numberOfClients],
-			dtc.InternalClientsets[i%numberOfClients],
-			extensions.Kind("DaemonSet"),
-			dtc.DaemonConfigs[i].Namespace,
-			dtc.DaemonConfigs[i].Name,
-		))
-	}
+	dtc.deleteSecrets(testPhaseDurations.StartPhase(910, "secrets deletion"))
+	dtc.deleteConfigMaps(testPhaseDurations.StartPhase(920, "configmaps deletion"))
+	dtc.deleteDaemonSets(numberOfClients, testPhaseDurations.StartPhase(930, "daemonsets deletion"))
 }
 
 // This test suite can take a long time to run, and can affect or be affected by other tests.
@@ -307,12 +355,21 @@ var _ = SIGDescribe("Density", func() {
 	var nodeCpuCapacity int64
 	var nodeMemCapacity int64
 	var nodes *v1.NodeList
-	var masters sets.String
 
 	testCaseBaseName := "density"
+	missingMeasurements := 0
+	var testPhaseDurations *timer.TestPhaseTimer
+	var profileGathererStopCh chan struct{}
 
 	// Gathers data prior to framework namespace teardown
 	AfterEach(func() {
+		// Stop apiserver CPU profile gatherer and gather memory allocations profile.
+		close(profileGathererStopCh)
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		framework.GatherApiserverMemoryProfile(&wg, "density")
+		wg.Wait()
+
 		saturationThreshold := time.Duration((totalPods / MinPodsPerSecondThroughput)) * time.Second
 		if saturationThreshold < MinSaturationThreshold {
 			saturationThreshold = MinSaturationThreshold
@@ -332,7 +389,6 @@ var _ = SIGDescribe("Density", func() {
 		framework.ExpectNoError(err)
 		if err == nil {
 			summaries = append(summaries, metrics)
-			Expect(highLatencyRequests).NotTo(BeNumerically(">", 0), "There should be no high-latency requests")
 		}
 
 		// Verify scheduler metrics.
@@ -343,8 +399,14 @@ var _ = SIGDescribe("Density", func() {
 		if err == nil {
 			summaries = append(summaries, latency)
 		}
+		summaries = append(summaries, testPhaseDurations)
 
 		framework.PrintSummaries(summaries, testCaseBaseName)
+
+		// Fail if there were some high-latency requests.
+		Expect(highLatencyRequests).NotTo(BeNumerically(">", 0), "There should be no high-latency requests")
+		// Fail if more than the allowed threshold of measurements were missing in the latencyTest.
+		Expect(missingMeasurements <= MaxMissingPodStartupMeasurements).To(Equal(true))
 	})
 
 	options := framework.FrameworkOptions{
@@ -359,8 +421,9 @@ var _ = SIGDescribe("Density", func() {
 	BeforeEach(func() {
 		c = f.ClientSet
 		ns = f.Namespace.Name
+		testPhaseDurations = timer.NewTestPhaseTimer()
 
-		masters, nodes = framework.GetMasterAndWorkerNodesOrDie(c)
+		_, nodes = framework.GetMasterAndWorkerNodesOrDie(c)
 		nodeCount = len(nodes.Items)
 		Expect(nodeCount).NotTo(BeZero())
 
@@ -391,6 +454,10 @@ var _ = SIGDescribe("Density", func() {
 			}
 			framework.Logf("Name: %v, clusterIP: %v, externalIP: %v", node.ObjectMeta.Name, internalIP, externalIP)
 		}
+
+		// Start apiserver CPU profile gatherer with frequency based on cluster size.
+		profileGatheringDelay := time.Duration(5+nodeCount/100) * time.Minute
+		profileGathererStopCh = framework.StartApiserverCPUProfileGatherer(profileGatheringDelay)
 	})
 
 	type Density struct {
@@ -404,6 +471,7 @@ var _ = SIGDescribe("Density", func() {
 		secretsPerPod    int
 		configMapsPerPod int
 		daemonsPerNode   int
+		quotas           bool
 	}
 
 	densityTests := []Density{
@@ -422,13 +490,19 @@ var _ = SIGDescribe("Density", func() {
 		{podsPerNode: 30, runLatencyTest: true, kind: extensions.Kind("Deployment"), secretsPerPod: 2},
 		// Test with configmaps
 		{podsPerNode: 30, runLatencyTest: true, kind: extensions.Kind("Deployment"), configMapsPerPod: 2},
+		// Test with quotas
+		{podsPerNode: 30, runLatencyTest: true, kind: api.Kind("ReplicationController"), quotas: true},
+	}
+
+	isCanonical := func(test *Density) bool {
+		return test.kind == api.Kind("ReplicationController") && test.daemonsPerNode == 0 && test.secretsPerPod == 0 && test.configMapsPerPod == 0 && !test.quotas
 	}
 
 	for _, testArg := range densityTests {
 		feature := "ManualPerformance"
 		switch testArg.podsPerNode {
 		case 30:
-			if testArg.kind == api.Kind("ReplicationController") && testArg.daemonsPerNode == 0 && testArg.secretsPerPod == 0 && testArg.configMapsPerPod == 0 {
+			if isCanonical(&testArg) {
 				feature = "Performance"
 			}
 		case 95:
@@ -443,8 +517,13 @@ var _ = SIGDescribe("Density", func() {
 			testArg.configMapsPerPod,
 			testArg.daemonsPerNode,
 		)
+		if testArg.quotas {
+			name += " with quotas"
+		}
 		itArg := testArg
 		It(name, func() {
+			nodePrepPhase := testPhaseDurations.StartPhase(100, "node preparation")
+			defer nodePrepPhase.End()
 			nodePreparer := framework.NewE2ETestNodePreparer(
 				f.ClientSet,
 				[]testutils.CountToStrategy{{Count: nodeCount, Strategy: &testutils.TrivialNodePrepareStrategy{}}},
@@ -460,11 +539,15 @@ var _ = SIGDescribe("Density", func() {
 			fileHndl, err := os.Create(fmt.Sprintf(framework.TestContext.OutputDir+"/%s/pod_states.csv", uuid))
 			framework.ExpectNoError(err)
 			defer fileHndl.Close()
+			nodePrepPhase.End()
 
 			// nodeCountPerNamespace and CreateNamespaces are defined in load.go
 			numberOfCollections := (nodeCount + nodeCountPerNamespace - 1) / nodeCountPerNamespace
-			namespaces, err := CreateNamespaces(f, numberOfCollections, fmt.Sprintf("density-%v", testArg.podsPerNode))
+			namespaces, err := CreateNamespaces(f, numberOfCollections, fmt.Sprintf("density-%v", testArg.podsPerNode), testPhaseDurations.StartPhase(200, "namespace creation"))
 			framework.ExpectNoError(err)
+			if itArg.quotas {
+				framework.ExpectNoError(CreateQuotas(f, namespaces, totalPods+nodeCount, testPhaseDurations.StartPhase(210, "quota creation")))
+			}
 
 			configs := make([]testutils.RunObjectConfig, numberOfCollections)
 			secretConfigs := make([]*testutils.SecretConfig, 0, numberOfCollections*itArg.secretsPerPod)
@@ -474,7 +557,7 @@ var _ = SIGDescribe("Density", func() {
 			podThroughput := 20
 			timeout := time.Duration(totalPods/podThroughput)*time.Second + 3*time.Minute
 			// createClients is defined in load.go
-			clients, internalClients, err := createClients(numberOfCollections)
+			clients, internalClients, scalesClients, err := createClients(numberOfCollections)
 			for i := 0; i < numberOfCollections; i++ {
 				nsName := namespaces[i].Name
 				secretNames := []string{}
@@ -505,7 +588,8 @@ var _ = SIGDescribe("Density", func() {
 				baseConfig := &testutils.RCConfig{
 					Client:               clients[i],
 					InternalClient:       internalClients[i],
-					Image:                framework.GetPauseImageName(f.ClientSet),
+					ScalesGetter:         scalesClients[i],
+					Image:                imageutils.GetPauseImageName(),
 					Name:                 name,
 					Namespace:            nsName,
 					Labels:               map[string]string{"type": "densityPod"},
@@ -536,11 +620,12 @@ var _ = SIGDescribe("Density", func() {
 			}
 
 			// Single client is running out of http2 connections in delete phase, hence we need more.
-			clients, internalClients, err = createClients(2)
+			clients, internalClients, scalesClients, err = createClients(2)
 
 			dConfig := DensityTestConfig{
 				ClientSets:         clients,
 				InternalClientsets: internalClients,
+				ScaleClients:       scalesClients,
 				Configs:            configs,
 				PodCount:           totalPods,
 				PollInterval:       DensityPollInterval,
@@ -558,7 +643,7 @@ var _ = SIGDescribe("Density", func() {
 						LogFunc:   framework.Logf,
 					})
 			}
-			e2eStartupTime = runDensityTest(dConfig)
+			e2eStartupTime = runDensityTest(dConfig, testPhaseDurations)
 			if itArg.runLatencyTest {
 				By("Scheduling additional Pods to measure startup latencies")
 
@@ -606,12 +691,12 @@ var _ = SIGDescribe("Density", func() {
 						&cache.ListWatch{
 							ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 								options.LabelSelector = labels.SelectorFromSet(labels.Set{"type": additionalPodsPrefix}).String()
-								obj, err := c.Core().Pods(nsName).List(options)
+								obj, err := c.CoreV1().Pods(nsName).List(options)
 								return runtime.Object(obj), err
 							},
 							WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 								options.LabelSelector = labels.SelectorFromSet(labels.Set{"type": additionalPodsPrefix}).String()
-								return c.Core().Pods(nsName).Watch(options)
+								return c.CoreV1().Pods(nsName).Watch(options)
 							},
 						},
 						&v1.Pod{},
@@ -641,6 +726,8 @@ var _ = SIGDescribe("Density", func() {
 				}
 
 				// Create some additional pods with throughput ~5 pods/sec.
+				latencyPodStartupPhase := testPhaseDurations.StartPhase(800, "latency pods creation")
+				defer latencyPodStartupPhase.End()
 				var wg sync.WaitGroup
 				wg.Add(nodeCount)
 				// Explicitly set requests here.
@@ -660,11 +747,14 @@ var _ = SIGDescribe("Density", func() {
 					name := additionalPodsPrefix + "-" + strconv.Itoa(i)
 					nsName := namespaces[i%len(namespaces)].Name
 					rcNameToNsMap[name] = nsName
-					go createRunningPodFromRC(&wg, c, name, nsName, framework.GetPauseImageName(f.ClientSet), additionalPodsPrefix, cpuRequest, memRequest)
+					go createRunningPodFromRC(&wg, c, name, nsName, imageutils.GetPauseImageName(), additionalPodsPrefix, cpuRequest, memRequest)
 					time.Sleep(200 * time.Millisecond)
 				}
 				wg.Wait()
+				latencyPodStartupPhase.End()
 
+				latencyMeasurementPhase := testPhaseDurations.StartPhase(810, "pod startup latencies measurement")
+				defer latencyMeasurementPhase.End()
 				By("Waiting for all Pods begin observed by the watch...")
 				waitTimeout := 10 * time.Minute
 				for start := time.Now(); len(watchTimes) < nodeCount; time.Sleep(10 * time.Second) {
@@ -695,7 +785,7 @@ var _ = SIGDescribe("Density", func() {
 						"source":                   v1.DefaultSchedulerName,
 					}.AsSelector().String()
 					options := metav1.ListOptions{FieldSelector: selector}
-					schedEvents, err := c.Core().Events(nsName).List(options)
+					schedEvents, err := c.CoreV1().Events(nsName).List(options)
 					framework.ExpectNoError(err)
 					for k := range createTimes {
 						for _, event := range schedEvents.Items {
@@ -717,23 +807,23 @@ var _ = SIGDescribe("Density", func() {
 					sched, ok := scheduleTimes[name]
 					if !ok {
 						framework.Logf("Failed to find schedule time for %v", name)
+						missingMeasurements++
 					}
-					Expect(ok).To(Equal(true))
 					run, ok := runTimes[name]
 					if !ok {
 						framework.Logf("Failed to find run time for %v", name)
+						missingMeasurements++
 					}
-					Expect(ok).To(Equal(true))
 					watch, ok := watchTimes[name]
 					if !ok {
 						framework.Logf("Failed to find watch time for %v", name)
+						missingMeasurements++
 					}
-					Expect(ok).To(Equal(true))
 					node, ok := nodeNames[name]
 					if !ok {
 						framework.Logf("Failed to find node for %v", name)
+						missingMeasurements++
 					}
-					Expect(ok).To(Equal(true))
 
 					scheduleLag = append(scheduleLag, framework.PodLatencyData{Name: name, Node: node, Latency: sched.Time.Sub(create.Time)})
 					startupLag = append(startupLag, framework.PodLatencyData{Name: name, Node: node, Latency: run.Time.Sub(sched.Time)})
@@ -748,29 +838,45 @@ var _ = SIGDescribe("Density", func() {
 				sort.Sort(framework.LatencySlice(schedToWatchLag))
 				sort.Sort(framework.LatencySlice(e2eLag))
 
-				framework.PrintLatencies(scheduleLag, "worst schedule latencies")
-				framework.PrintLatencies(startupLag, "worst run-after-schedule latencies")
-				framework.PrintLatencies(watchLag, "worst watch latencies")
-				framework.PrintLatencies(schedToWatchLag, "worst scheduled-to-end total latencies")
-				framework.PrintLatencies(e2eLag, "worst e2e total latencies")
+				framework.PrintLatencies(scheduleLag, "worst create-to-schedule latencies")
+				framework.PrintLatencies(startupLag, "worst schedule-to-run latencies")
+				framework.PrintLatencies(watchLag, "worst run-to-watch latencies")
+				framework.PrintLatencies(schedToWatchLag, "worst schedule-to-watch latencies")
+				framework.PrintLatencies(e2eLag, "worst e2e latencies")
+
+				// Capture latency metrics related to pod-startup.
+				podStartupLatency := &framework.PodStartupLatency{
+					CreateToScheduleLatency: framework.ExtractLatencyMetrics(scheduleLag),
+					ScheduleToRunLatency:    framework.ExtractLatencyMetrics(startupLag),
+					RunToWatchLatency:       framework.ExtractLatencyMetrics(watchLag),
+					ScheduleToWatchLatency:  framework.ExtractLatencyMetrics(schedToWatchLag),
+					E2ELatency:              framework.ExtractLatencyMetrics(e2eLag),
+				}
+				f.TestSummaries = append(f.TestSummaries, podStartupLatency)
 
 				// Test whether e2e pod startup time is acceptable.
-				podStartupLatency := &framework.PodStartupLatency{Latency: framework.ExtractLatencyMetrics(e2eLag)}
-				f.TestSummaries = append(f.TestSummaries, podStartupLatency)
-				framework.ExpectNoError(framework.VerifyPodStartupLatency(podStartupLatency))
+				podStartupLatencyThreshold := framework.LatencyMetric{
+					Perc50: PodStartupLatencyThreshold,
+					Perc90: PodStartupLatencyThreshold,
+					Perc99: PodStartupLatencyThreshold,
+				}
+				framework.ExpectNoError(framework.VerifyLatencyWithinThreshold(podStartupLatencyThreshold, podStartupLatency.E2ELatency, "pod startup"))
 
 				framework.LogSuspiciousLatency(startupLag, e2eLag, nodeCount, c)
+				latencyMeasurementPhase.End()
 
 				By("Removing additional replication controllers")
+				podDeletionPhase := testPhaseDurations.StartPhase(820, "latency pods deletion")
+				defer podDeletionPhase.End()
 				deleteRC := func(i int) {
 					defer GinkgoRecover()
 					name := additionalPodsPrefix + "-" + strconv.Itoa(i+1)
 					framework.ExpectNoError(framework.DeleteRCAndWaitForGC(c, rcNameToNsMap[name], name))
 				}
 				workqueue.Parallelize(25, nodeCount, deleteRC)
+				podDeletionPhase.End()
 			}
-
-			cleanupDensityTest(dConfig)
+			cleanupDensityTest(dConfig, testPhaseDurations)
 		})
 	}
 })
@@ -812,8 +918,7 @@ func createRunningPodFromRC(wg *sync.WaitGroup, c clientset.Interface, name, ns,
 			},
 		},
 	}
-	_, err := c.Core().ReplicationControllers(ns).Create(rc)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(testutils.CreateRCWithRetries(c, ns, rc))
 	framework.ExpectNoError(framework.WaitForControlledPodsRunning(c, ns, name, api.Kind("ReplicationController")))
 	framework.Logf("Found pod '%s' running", name)
 }

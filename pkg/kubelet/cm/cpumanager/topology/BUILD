@@ -1,9 +1,18 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go_default_library",
-    srcs = ["doc.go"],
+    srcs = [
+        "doc.go",
+        "topology.go",
+    ],
+    importpath = "k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/topology",
     visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/kubelet/cm/cpuset:go_default_library",
+        "//vendor/github.com/golang/glog:go_default_library",
+        "//vendor/github.com/google/cadvisor/info/v1:go_default_library",
+    ],
 )
 
 filegroup(
@@ -18,4 +27,11 @@ filegroup(
     srcs = [":package-srcs"],
     tags = ["automanaged"],
     visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["topology_test.go"],
+    embed = [":go_default_library"],
+    deps = ["//vendor/github.com/google/cadvisor/info/v1:go_default_library"],
 )

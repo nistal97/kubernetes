@@ -28,15 +28,18 @@ import (
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/api"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 const (
 	defaultNodeAllocatableCgroupName = "kubepods"
 )
 
+//createNodeAllocatableCgroups creates Node Allocatable Cgroup when CgroupsPerQOS flag is specified as true
 func (cm *containerManagerImpl) createNodeAllocatableCgroups() error {
 	cgroupConfig := &CgroupConfig{
 		Name: CgroupName(cm.cgroupRoot),
@@ -53,7 +56,7 @@ func (cm *containerManagerImpl) createNodeAllocatableCgroups() error {
 	return nil
 }
 
-// Enforce Node Allocatable Cgroup settings.
+// enforceNodeAllocatableCgroups enforce Node Allocatable Cgroup settings.
 func (cm *containerManagerImpl) enforceNodeAllocatableCgroups() error {
 	nc := cm.NodeConfig.NodeAllocatableConfig
 
@@ -61,7 +64,7 @@ func (cm *containerManagerImpl) enforceNodeAllocatableCgroups() error {
 	// default cpu shares on cgroups are low and can cause cpu starvation.
 	nodeAllocatable := cm.capacity
 	// Use Node Allocatable limits instead of capacity if the user requested enforcing node allocatable.
-	if cm.CgroupsPerQOS && nc.EnforceNodeAllocatable.Has(NodeAllocatableEnforcementKey) {
+	if cm.CgroupsPerQOS && nc.EnforceNodeAllocatable.Has(kubetypes.NodeAllocatableEnforcementKey) {
 		nodeAllocatable = cm.getNodeAllocatableAbsolute()
 	}
 
@@ -81,7 +84,7 @@ func (cm *containerManagerImpl) enforceNodeAllocatableCgroups() error {
 	}
 
 	// If Node Allocatable is enforced on a node that has not been drained or is updated on an existing node to a lower value,
-	// existing memory usage across pods might be higher that current Node Allocatable Memory Limits.
+	// existing memory usage across pods might be higher than current Node Allocatable Memory Limits.
 	// Pod Evictions are expected to bring down memory usage to below Node Allocatable limits.
 	// Until evictions happen retry cgroup updates.
 	// Update limits on non root cgroup-root to be safe since the default limits for CPU can be too low.
@@ -100,7 +103,7 @@ func (cm *containerManagerImpl) enforceNodeAllocatableCgroups() error {
 		}()
 	}
 	// Now apply kube reserved and system reserved limits if required.
-	if nc.EnforceNodeAllocatable.Has(SystemReservedEnforcementKey) {
+	if nc.EnforceNodeAllocatable.Has(kubetypes.SystemReservedEnforcementKey) {
 		glog.V(2).Infof("Enforcing System reserved on cgroup %q with limits: %+v", nc.SystemReservedCgroupName, nc.SystemReserved)
 		if err := enforceExistingCgroup(cm.cgroupManager, nc.SystemReservedCgroupName, nc.SystemReserved); err != nil {
 			message := fmt.Sprintf("Failed to enforce System Reserved Cgroup Limits on %q: %v", nc.SystemReservedCgroupName, err)
@@ -109,7 +112,7 @@ func (cm *containerManagerImpl) enforceNodeAllocatableCgroups() error {
 		}
 		cm.recorder.Eventf(nodeRef, v1.EventTypeNormal, events.SuccessfulNodeAllocatableEnforcement, "Updated limits on system reserved cgroup %v", nc.SystemReservedCgroupName)
 	}
-	if nc.EnforceNodeAllocatable.Has(KubeReservedEnforcementKey) {
+	if nc.EnforceNodeAllocatable.Has(kubetypes.KubeReservedEnforcementKey) {
 		glog.V(2).Infof("Enforcing kube reserved on cgroup %q with limits: %+v", nc.KubeReservedCgroupName, nc.KubeReserved)
 		if err := enforceExistingCgroup(cm.cgroupManager, nc.KubeReservedCgroupName, nc.KubeReserved); err != nil {
 			message := fmt.Sprintf("Failed to enforce Kube Reserved Cgroup Limits on %q: %v", nc.KubeReservedCgroupName, err)
@@ -137,7 +140,7 @@ func enforceExistingCgroup(cgroupManager CgroupManager, cName string, rl v1.Reso
 	return nil
 }
 
-// Returns a ResourceConfig object that can be used to create or update cgroups via CgroupManager interface.
+// getCgroupConfig returns a ResourceConfig object that can be used to create or update cgroups via CgroupManager interface.
 func getCgroupConfig(rl v1.ResourceList) *ResourceConfig {
 	// TODO(vishh): Set CPU Quota if necessary.
 	if rl == nil {
@@ -154,6 +157,10 @@ func getCgroupConfig(rl v1.ResourceList) *ResourceConfig {
 		val := MilliCPUToShares(q.MilliValue())
 		rc.CpuShares = &val
 	}
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.HugePages) {
+		rc.HugePageLimit = HugePageLimits(rl)
+	}
+
 	return &rc
 }
 
@@ -180,7 +187,7 @@ func (cm *containerManagerImpl) getNodeAllocatableAbsolute() v1.ResourceList {
 
 }
 
-// GetNodeAllocatable returns amount of compute or storage resource that have to be reserved on this node from scheduling.
+// GetNodeAllocatableReservation returns amount of compute or storage resource that have to be reserved on this node from scheduling.
 func (cm *containerManagerImpl) GetNodeAllocatableReservation() v1.ResourceList {
 	evictionReservation := hardEvictionReservation(cm.HardEvictionThresholds, cm.capacity)
 	result := make(v1.ResourceList)
@@ -232,16 +239,7 @@ func (cm *containerManagerImpl) validateNodeAllocatable() error {
 	var errors []string
 	nar := cm.GetNodeAllocatableReservation()
 	for k, v := range nar {
-		capacityClone, err := api.Scheme.DeepCopy(cm.capacity[k])
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("DeepCopy capacity error"))
-		}
-		value, ok := capacityClone.(resource.Quantity)
-		if !ok {
-			return fmt.Errorf(
-				"failed to cast object %#v to Quantity",
-				capacityClone)
-		}
+		value := cm.capacity[k].DeepCopy()
 		value.Sub(v)
 
 		if value.Sign() < 0 {

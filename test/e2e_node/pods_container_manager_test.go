@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	"k8s.io/kubernetes/test/e2e/framework"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 
 	"github.com/golang/glog"
 	. "github.com/onsi/ginkgo"
@@ -53,12 +54,10 @@ func getResourceRequirements(requests, limits v1.ResourceList) v1.ResourceRequir
 }
 
 const (
-	// Kubelet internal cgroup name for node allocatable cgroup.
-	defaultNodeAllocatableCgroup = "kubepods"
 	// Kubelet internal cgroup name for burstable tier
 	burstableCgroup = "burstable"
-	// Kubelet internal cgroup name for burstable tier
-	bestEffortCgroup = "burstable"
+	// Kubelet internal cgroup name for besteffort tier
+	bestEffortCgroup = "besteffort"
 )
 
 // makePodToVerifyCgroups returns a pod that verifies the existence of the specified cgroups.
@@ -67,12 +66,7 @@ func makePodToVerifyCgroups(cgroupNames []cm.CgroupName) *v1.Pod {
 	cgroupFsNames := []string{}
 	for _, cgroupName := range cgroupNames {
 		// Add top level cgroup used to enforce node allocatable.
-		cgroupName = cm.CgroupName(path.Join(defaultNodeAllocatableCgroup, string(cgroupName)))
-		if framework.TestContext.KubeletConfig.CgroupDriver == "systemd" {
-			cgroupFsNames = append(cgroupFsNames, cm.ConvertCgroupNameToSystemd(cgroupName, true))
-		} else {
-			cgroupFsNames = append(cgroupFsNames, string(cgroupName))
-		}
+		cgroupFsNames = append(cgroupFsNames, toCgroupFsName(path.Join(defaultNodeAllocatableCgroup, string(cgroupName))))
 	}
 	glog.Infof("expecting %v cgroups to be found", cgroupFsNames)
 	// build the pod command to either verify cgroups exist
@@ -90,7 +84,7 @@ func makePodToVerifyCgroups(cgroupNames []cm.CgroupName) *v1.Pod {
 			RestartPolicy: v1.RestartPolicyNever,
 			Containers: []v1.Container{
 				{
-					Image:   "gcr.io/google_containers/busybox:1.24",
+					Image:   busyboxImage,
 					Name:    "container" + string(uuid.NewUUID()),
 					Command: []string{"sh", "-c", command},
 					VolumeMounts: []v1.VolumeMount{
@@ -116,10 +110,7 @@ func makePodToVerifyCgroups(cgroupNames []cm.CgroupName) *v1.Pod {
 
 // makePodToVerifyCgroupRemoved verfies the specified cgroup does not exist.
 func makePodToVerifyCgroupRemoved(cgroupName cm.CgroupName) *v1.Pod {
-	cgroupFsName := string(cgroupName)
-	if framework.TestContext.KubeletConfig.CgroupDriver == "systemd" {
-		cgroupFsName = cm.ConvertCgroupNameToSystemd(cm.CgroupName(cgroupName), true)
-	}
+	cgroupFsName := toCgroupFsName(string(cgroupName))
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "pod" + string(uuid.NewUUID()),
@@ -128,7 +119,7 @@ func makePodToVerifyCgroupRemoved(cgroupName cm.CgroupName) *v1.Pod {
 			RestartPolicy: v1.RestartPolicyOnFailure,
 			Containers: []v1.Container{
 				{
-					Image:   "gcr.io/google_containers/busybox:1.24",
+					Image:   busyboxImage,
 					Name:    "container" + string(uuid.NewUUID()),
 					Command: []string{"sh", "-c", "for i in `seq 1 10`; do if [ ! -d /tmp/memory/" + cgroupFsName + " ] && [ ! -d /tmp/cpu/" + cgroupFsName + " ]; then exit 0; else sleep 10; fi; done; exit 1"},
 					VolumeMounts: []v1.VolumeMount{
@@ -188,7 +179,7 @@ var _ = framework.KubeDescribe("Kubelet Cgroup Manager", func() {
 						Spec: v1.PodSpec{
 							Containers: []v1.Container{
 								{
-									Image:     framework.GetPauseImageName(f.ClientSet),
+									Image:     imageutils.GetPauseImageName(),
 									Name:      "container" + string(uuid.NewUUID()),
 									Resources: getResourceRequirements(getResourceList("100m", "100Mi"), getResourceList("100m", "100Mi")),
 								},
@@ -232,7 +223,7 @@ var _ = framework.KubeDescribe("Kubelet Cgroup Manager", func() {
 						Spec: v1.PodSpec{
 							Containers: []v1.Container{
 								{
-									Image:     framework.GetPauseImageName(f.ClientSet),
+									Image:     imageutils.GetPauseImageName(),
 									Name:      "container" + string(uuid.NewUUID()),
 									Resources: getResourceRequirements(getResourceList("", ""), getResourceList("", "")),
 								},
@@ -276,7 +267,7 @@ var _ = framework.KubeDescribe("Kubelet Cgroup Manager", func() {
 						Spec: v1.PodSpec{
 							Containers: []v1.Container{
 								{
-									Image:     framework.GetPauseImageName(f.ClientSet),
+									Image:     imageutils.GetPauseImageName(),
 									Name:      "container" + string(uuid.NewUUID()),
 									Resources: getResourceRequirements(getResourceList("100m", "100Mi"), getResourceList("200m", "200Mi")),
 								},

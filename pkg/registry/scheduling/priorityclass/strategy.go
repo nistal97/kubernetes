@@ -21,7 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/storage/names"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/scheduling"
 	"k8s.io/kubernetes/pkg/apis/scheduling/validation"
 )
@@ -33,7 +33,7 @@ type priorityClassStrategy struct {
 }
 
 // Strategy is the default logic that applies when creating and updating PriorityClass objects.
-var Strategy = priorityClassStrategy{api.Scheme, names.SimpleNameGenerator}
+var Strategy = priorityClassStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
 // NamespaceScoped returns true because all PriorityClasses are global.
 func (priorityClassStrategy) NamespaceScoped() bool {
@@ -68,9 +68,7 @@ func (priorityClassStrategy) AllowCreateOnUpdate() bool {
 
 // ValidateUpdate is the default update validation for an end user.
 func (priorityClassStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
-	validationErrorList := validation.ValidatePriorityClass(obj.(*scheduling.PriorityClass))
-	updateErrorList := validation.ValidatePriorityClassUpdate(obj.(*scheduling.PriorityClass), old.(*scheduling.PriorityClass))
-	return append(validationErrorList, updateErrorList...)
+	return validation.ValidatePriorityClassUpdate(obj.(*scheduling.PriorityClass), old.(*scheduling.PriorityClass))
 }
 
 // AllowUnconditionalUpdate is the default update policy for PriorityClass objects.

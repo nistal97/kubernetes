@@ -25,7 +25,8 @@ import (
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/printers"
 )
 
@@ -112,7 +113,7 @@ func TestNewColumnPrinterFromSpec(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		printer, err := printers.NewCustomColumnsPrinterFromSpec(test.spec, api.Codecs.UniversalDecoder(), test.noHeaders)
+		printer, err := printers.NewCustomColumnsPrinterFromSpec(test.spec, legacyscheme.Codecs.UniversalDecoder(), test.noHeaders)
 		if test.expectErr {
 			if err == nil {
 				t.Errorf("[%s] unexpected non-error", test.name)
@@ -215,7 +216,7 @@ func TestNewColumnPrinterFromTemplate(t *testing.T) {
 	}
 	for _, test := range tests {
 		reader := bytes.NewBufferString(test.spec)
-		printer, err := printers.NewCustomColumnsPrinterFromTemplate(reader, api.Codecs.UniversalDecoder())
+		printer, err := printers.NewCustomColumnsPrinterFromTemplate(reader, legacyscheme.Codecs.UniversalDecoder())
 		if test.expectErr {
 			if err == nil {
 				t.Errorf("[%s] unexpected non-error", test.name)
@@ -286,12 +287,32 @@ bar
 foo       baz
 `,
 		},
+		{
+			columns: []printers.Column{
+				{
+					Header:    "NAME",
+					FieldSpec: "{.metadata.name}",
+				},
+				{
+					Header:    "API_VERSION",
+					FieldSpec: "{.apiVersion}",
+				},
+				{
+					Header:    "NOT_FOUND",
+					FieldSpec: "{.notFound}",
+				},
+			},
+			obj: &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}, TypeMeta: metav1.TypeMeta{APIVersion: "baz"}},
+			expectedOutput: `NAME      API_VERSION   NOT_FOUND
+foo       baz           <none>
+`,
+		},
 	}
 
 	for _, test := range tests {
 		printer := &printers.CustomColumnsPrinter{
 			Columns: test.columns,
-			Decoder: api.Codecs.UniversalDecoder(),
+			Decoder: legacyscheme.Codecs.UniversalDecoder(),
 		}
 		buffer := &bytes.Buffer{}
 		if err := printer.PrintObj(test.obj, buffer); err != nil {
@@ -300,5 +321,47 @@ foo       baz
 		if buffer.String() != test.expectedOutput {
 			t.Errorf("\nexpected:\n'%s'\nsaw\n'%s'\n", test.expectedOutput, buffer.String())
 		}
+	}
+}
+
+// this mimics how resource/get.go calls the customcolumn printer
+func TestIndividualPrintObjOnExistingTabWriter(t *testing.T) {
+	columns := []printers.Column{
+		{
+			Header:    "NAME",
+			FieldSpec: "{.metadata.name}",
+		},
+		{
+			Header:    "LONG COLUMN NAME", // name is longer than all values of label1
+			FieldSpec: "{.metadata.labels.label1}",
+		},
+		{
+			Header:    "LABEL 2",
+			FieldSpec: "{.metadata.labels.label2}",
+		},
+	}
+	objects := []*v1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "foo", Labels: map[string]string{"label1": "foo", "label2": "foo"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "bar", Labels: map[string]string{"label1": "bar", "label2": "bar"}}},
+	}
+	expectedOutput := `NAME      LONG COLUMN NAME   LABEL 2
+foo       foo                foo
+bar       bar                bar
+`
+
+	buffer := &bytes.Buffer{}
+	tabWriter := printers.GetNewTabWriter(buffer)
+	printer := &printers.CustomColumnsPrinter{
+		Columns: columns,
+		Decoder: legacyscheme.Codecs.UniversalDecoder(),
+	}
+	for _, obj := range objects {
+		if err := printer.PrintObj(obj, tabWriter); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	tabWriter.Flush()
+	if buffer.String() != expectedOutput {
+		t.Errorf("\nexpected:\n'%s'\nsaw\n'%s'\n", expectedOutput, buffer.String())
 	}
 }

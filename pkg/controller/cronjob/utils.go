@@ -24,19 +24,19 @@ import (
 	"github.com/robfig/cron"
 
 	batchv1 "k8s.io/api/batch/v1"
-	batchv2alpha1 "k8s.io/api/batch/v2alpha1"
+	batchv1beta1 "k8s.io/api/batch/v1beta1"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ref "k8s.io/client-go/tools/reference"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 )
 
 // Utilities for dealing with Jobs and CronJobs and time.
 
-func inActiveList(sj batchv2alpha1.CronJob, uid types.UID) bool {
+func inActiveList(sj batchv1beta1.CronJob, uid types.UID) bool {
 	for _, j := range sj.Status.Active {
 		if j.UID == uid {
 			return true
@@ -45,7 +45,7 @@ func inActiveList(sj batchv2alpha1.CronJob, uid types.UID) bool {
 	return false
 }
 
-func deleteFromActiveList(sj *batchv2alpha1.CronJob, uid types.UID) {
+func deleteFromActiveList(sj *batchv1beta1.CronJob, uid types.UID) {
 	if sj == nil {
 		return
 	}
@@ -89,29 +89,11 @@ func groupJobsByParent(js []batchv1.Job) map[types.UID][]batchv1.Job {
 	return jobsBySj
 }
 
-// getNextStartTimeAfter gets the latest scheduled start time that is less than "now", or an error.
-func getNextStartTimeAfter(schedule string, now time.Time) (time.Time, error) {
-	// Using robfig/cron for cron scheduled parsing and next runtime
-	// computation. Not using the entire library because:
-	// - I want to detect when we missed a runtime due to being down.
-	//   - How do I set the time such that I can detect the last known runtime?
-	// - I guess the functions could launch a go-routine to start the job and
-	// then return.
-	// How to handle concurrency control.
-	// How to detect changes to schedules or deleted schedules and then
-	// update the jobs?
-	sched, err := cron.Parse(schedule)
-	if err != nil {
-		return time.Unix(0, 0), fmt.Errorf("Unparseable schedule: %s : %s", schedule, err)
-	}
-	return sched.Next(now), nil
-}
-
 // getRecentUnmetScheduleTimes gets a slice of times (from oldest to latest) that have passed when a Job should have started but did not.
 //
 // If there are too many (>100) unstarted times, just give up and return an empty slice.
 // If there were missed times prior to the last known start time, then those are not returned.
-func getRecentUnmetScheduleTimes(sj batchv2alpha1.CronJob, now time.Time) ([]time.Time, error) {
+func getRecentUnmetScheduleTimes(sj batchv1beta1.CronJob, now time.Time) ([]time.Time, error) {
 	starts := []time.Time{}
 	sched, err := cron.ParseStandard(sj.Spec.Schedule)
 	if err != nil {
@@ -144,7 +126,7 @@ func getRecentUnmetScheduleTimes(sj batchv2alpha1.CronJob, now time.Time) ([]tim
 
 	for t := sched.Next(earliestTime); !t.After(now); t = sched.Next(t) {
 		starts = append(starts, t)
-		// An object might miss several starts.  For example, if
+		// An object might miss several starts. For example, if
 		// controller gets wedged on friday at 5:01pm when everyone has
 		// gone home, and someone comes in on tuesday AM and discovers
 		// the problem and restarts the controller, then all the hourly
@@ -159,7 +141,7 @@ func getRecentUnmetScheduleTimes(sj batchv2alpha1.CronJob, now time.Time) ([]tim
 		// of this controller. In that case, we want to not try to list
 		// all the missed start times.
 		//
-		// I've somewhat arbitrarily picked 100, as more than 80, but
+		// I've somewhat arbitrarily picked 100, as more than 80,
 		// but less than "lots".
 		if len(starts) > 100 {
 			// We can't get the most recent times so just return an empty slice
@@ -170,17 +152,9 @@ func getRecentUnmetScheduleTimes(sj batchv2alpha1.CronJob, now time.Time) ([]tim
 }
 
 // getJobFromTemplate makes a Job from a CronJob
-func getJobFromTemplate(sj *batchv2alpha1.CronJob, scheduledTime time.Time) (*batchv1.Job, error) {
-	// TODO: consider adding the following labels:
-	// nominal-start-time=$RFC_3339_DATE_OF_INTENDED_START -- for user convenience
-	// scheduled-job-name=$SJ_NAME -- for user convenience
+func getJobFromTemplate(sj *batchv1beta1.CronJob, scheduledTime time.Time) (*batchv1.Job, error) {
 	labels := copyLabels(&sj.Spec.JobTemplate)
 	annotations := copyAnnotations(&sj.Spec.JobTemplate)
-	createdByRefJson, err := makeCreatedByRefJson(sj)
-	if err != nil {
-		return nil, err
-	}
-	annotations[v1.CreatedByAnnotation] = string(createdByRefJson)
 	// We want job names for a given nominal start time to have a deterministic name to avoid the same job being created twice
 	name := fmt.Sprintf("%s-%d", sj.Name, getTimeHash(scheduledTime))
 
@@ -192,7 +166,7 @@ func getJobFromTemplate(sj *batchv2alpha1.CronJob, scheduledTime time.Time) (*ba
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(sj, controllerKind)},
 		},
 	}
-	if err := api.Scheme.Convert(&sj.Spec.JobTemplate.Spec, &job.Spec, nil); err != nil {
+	if err := legacyscheme.Scheme.Convert(&sj.Spec.JobTemplate.Spec, &job.Spec, nil); err != nil {
 		return nil, fmt.Errorf("unable to convert job template: %v", err)
 	}
 	return job, nil
@@ -205,7 +179,7 @@ func getTimeHash(scheduledTime time.Time) int64 {
 
 // makeCreatedByRefJson makes a json string with an object reference for use in "created-by" annotation value
 func makeCreatedByRefJson(object runtime.Object) (string, error) {
-	createdByRef, err := ref.GetReference(api.Scheme, object)
+	createdByRef, err := ref.GetReference(legacyscheme.Scheme, object)
 	if err != nil {
 		return "", fmt.Errorf("unable to get controller reference: %v", err)
 	}
@@ -213,7 +187,7 @@ func makeCreatedByRefJson(object runtime.Object) (string, error) {
 	// TODO: this code was not safe previously - as soon as new code came along that switched to v2, old clients
 	//   would be broken upon reading it. This is explicitly hardcoded to v1 to guarantee predictable deployment.
 	//   We need to consistently handle this case of annotation versioning.
-	codec := api.Codecs.LegacyCodec(schema.GroupVersion{Group: v1.GroupName, Version: "v1"})
+	codec := legacyscheme.Codecs.LegacyCodec(schema.GroupVersion{Group: v1.GroupName, Version: "v1"})
 
 	createdByRefJson, err := runtime.Encode(codec, &v1.SerializedReference{
 		Reference: *createdByRef,

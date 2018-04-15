@@ -20,14 +20,15 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/spf13/cobra"
+	"k8s.io/kubernetes/pkg/printers"
 
+	"github.com/spf13/cobra"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
@@ -39,22 +40,25 @@ import (
 type SelectorOptions struct {
 	fileOptions resource.FilenameOptions
 
+	PrintFlags *printers.PrintFlags
+
 	local       bool
 	dryrun      bool
 	all         bool
 	record      bool
 	changeCause string
+	output      string
 
 	resources []string
 	selector  *metav1.LabelSelector
 
 	out              io.Writer
-	PrintObject      func(obj runtime.Object) error
 	ClientForMapping func(mapping *meta.RESTMapping) (resource.RESTClient, error)
+
+	PrintObj printers.ResourcePrinterFunc
 
 	builder *resource.Builder
 	mapper  meta.RESTMapper
-	encoder runtime.Encoder
 }
 
 var (
@@ -74,11 +78,14 @@ var (
 // NewCmdSelector is the "set selector" command.
 func NewCmdSelector(f cmdutil.Factory, out io.Writer) *cobra.Command {
 	options := &SelectorOptions{
+		PrintFlags: printers.NewPrintFlags("selector updated"),
+
 		out: out,
 	}
 
 	cmd := &cobra.Command{
-		Use:     "selector (-f FILENAME | TYPE NAME) EXPRESSIONS [--resource-version=version]",
+		Use: "selector (-f FILENAME | TYPE NAME) EXPRESSIONS [--resource-version=version]",
+		DisableFlagsInUseLine: true,
 		Short:   i18n.T("Set the selector on a resource"),
 		Long:    fmt.Sprintf(selectorLong, validation.LabelValueMaxLength),
 		Example: selectorExample,
@@ -88,14 +95,17 @@ func NewCmdSelector(f cmdutil.Factory, out io.Writer) *cobra.Command {
 			cmdutil.CheckErr(options.RunSelector())
 		},
 	}
-	cmdutil.AddPrinterFlags(cmd)
-	cmd.Flags().Bool("all", false, "Select all resources in the namespace of the specified resource types")
+
+	options.PrintFlags.AddFlags(cmd)
+
+	cmd.Flags().Bool("all", false, "Select all resources, including uninitialized ones, in the namespace of the specified resource types")
 	cmd.Flags().Bool("local", false, "If true, set selector will NOT contact api-server but run locally.")
 	cmd.Flags().String("resource-version", "", "If non-empty, the selectors update will only succeed if this is the current resource-version for the object. Only valid when specifying a single resource.")
 	usage := "the resource to update the selectors"
 	cmdutil.AddFilenameOptionFlags(cmd, &options.fileOptions, usage)
 	cmdutil.AddDryRunFlag(cmd)
 	cmdutil.AddRecordFlag(cmd)
+	cmdutil.AddIncludeUninitializedFlag(cmd)
 
 	return cmd
 }
@@ -106,6 +116,7 @@ func (o *SelectorOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args [
 	o.all = cmdutil.GetFlagBool(cmd, "all")
 	o.record = cmdutil.GetRecordFlag(cmd)
 	o.dryrun = cmdutil.GetDryRunFlag(cmd)
+	o.output = cmdutil.GetFlagString(cmd, "output")
 
 	cmdNamespace, enforceNamespace, err := f.DefaultNamespace()
 	if err != nil {
@@ -115,27 +126,44 @@ func (o *SelectorOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args [
 	o.changeCause = f.Command(cmd, false)
 	mapper, _ := f.Object()
 	o.mapper = mapper
-	o.encoder = f.JSONEncoder()
+
 	o.resources, o.selector, err = getResourcesAndSelector(args)
 	if err != nil {
 		return err
 	}
 
-	o.builder = f.NewBuilder(!o.local).
+	includeUninitialized := cmdutil.ShouldIncludeUninitialized(cmd, false)
+	o.builder = f.NewBuilder().
+		Internal().
+		LocalParam(o.local).
 		ContinueOnError().
 		NamespaceParam(cmdNamespace).DefaultNamespace().
 		FilenameParam(enforceNamespace, &o.fileOptions).
+		IncludeUninitialized(includeUninitialized).
 		Flatten()
 
 	if !o.local {
-		o.builder = o.builder.
+		o.builder.
 			ResourceTypeOrNameArgs(o.all, o.resources...).
 			Latest()
+	} else {
+		// if a --local flag was provided, and a resource was specified in the form
+		// <resource>/<name>, fail immediately as --local cannot query the api server
+		// for the specified resource.
+		if len(o.resources) > 0 {
+			return resource.LocalResourceError
+		}
 	}
 
-	o.PrintObject = func(obj runtime.Object) error {
-		return f.PrintObject(cmd, o.local, mapper, obj, o.out)
+	if o.dryrun {
+		o.PrintFlags.Complete("%s (dry run)")
 	}
+	printer, err := o.PrintFlags.ToPrinter()
+	if err != nil {
+		return err
+	}
+	o.PrintObj = printer.PrintObj
+
 	o.ClientForMapping = func(mapping *meta.RESTMapping) (resource.RESTClient, error) {
 		return f.ClientForMapping(mapping)
 	}
@@ -163,11 +191,13 @@ func (o *SelectorOptions) RunSelector() error {
 
 	return r.Visit(func(info *resource.Info, err error) error {
 		patch := &Patch{Info: info}
-		CalculatePatch(patch, o.encoder, func(info *resource.Info) ([]byte, error) {
+		CalculatePatch(patch, cmdutil.InternalVersionJSONEncoder(), func(info *resource.Info) ([]byte, error) {
+			versioned := info.AsVersioned()
+			patch.Info.Object = versioned
 			selectErr := updateSelectorForObject(info.Object, *o.selector)
 
 			if selectErr == nil {
-				return runtime.Encode(o.encoder, info.Object)
+				return runtime.Encode(cmdutil.InternalVersionJSONEncoder(), info.Object)
 			}
 			return nil, selectErr
 		})
@@ -176,8 +206,7 @@ func (o *SelectorOptions) RunSelector() error {
 			return patch.Err
 		}
 		if o.local || o.dryrun {
-			o.PrintObject(info.Object)
-			return nil
+			return o.PrintObj(info.Object, o.out)
 		}
 
 		patched, err := resource.NewHelper(info.Client, info.Mapping).Patch(info.Namespace, info.Name, types.StrategicMergePatchType, patch.Patch)
@@ -194,8 +223,7 @@ func (o *SelectorOptions) RunSelector() error {
 		}
 
 		info.Refresh(patched, true)
-		cmdutil.PrintSuccess(o.mapper, false, o.out, info.Mapping.Resource, info.Name, o.dryrun, "selector updated")
-		return nil
+		return o.PrintObj(patch.Info.AsVersioned(), o.out)
 	})
 }
 
@@ -212,7 +240,7 @@ func updateSelectorForObject(obj runtime.Object, selector metav1.LabelSelector) 
 	}
 	var err error
 	switch t := obj.(type) {
-	case *api.Service:
+	case *v1.Service:
 		t.Spec.Selector, err = copyOldSelector()
 	default:
 		err = fmt.Errorf("setting a selector is only supported for Services")

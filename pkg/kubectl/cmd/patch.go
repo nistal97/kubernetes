@@ -30,17 +30,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/kubectl"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
+	"k8s.io/kubernetes/pkg/kubectl/scheme"
 	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
-	"k8s.io/kubernetes/pkg/printers"
 )
 
 var patchTypes = map[string]types.PatchType{"json": types.JSONPatchType, "merge": types.MergePatchType, "strategic": types.StrategicMergePatchType}
@@ -50,71 +48,68 @@ var patchTypes = map[string]types.PatchType{"json": types.JSONPatchType, "merge"
 type PatchOptions struct {
 	resource.FilenameOptions
 
-	Local bool
+	Local  bool
+	DryRun bool
 
 	OutputFormat string
 }
 
 var (
 	patchLong = templates.LongDesc(i18n.T(`
-		Update field(s) of a resource using strategic merge patch
+		Update field(s) of a resource using strategic merge patch, a JSON merge patch, or a JSON patch.
 
 		JSON and YAML formats are accepted.
 
 		Please refer to the models in https://htmlpreview.github.io/?https://github.com/kubernetes/kubernetes/blob/HEAD/docs/api-reference/v1/definitions.html to find if a field is mutable.`))
 
 	patchExample = templates.Examples(i18n.T(`
-		# Partially update a node using strategic merge patch
+		# Partially update a node using a strategic merge patch. Specify the patch as JSON.
 		kubectl patch node k8s-node-1 -p '{"spec":{"unschedulable":true}}'
 
-		# Partially update a node identified by the type and name specified in "node.json" using strategic merge patch
+		# Partially update a node using a strategic merge patch. Specify the patch as YAML.
+		kubectl patch node k8s-node-1 -p $'spec:\n unschedulable: true'
+
+		# Partially update a node identified by the type and name specified in "node.json" using strategic merge patch.
 		kubectl patch -f node.json -p '{"spec":{"unschedulable":true}}'
 
-		# Update a container's image; spec.containers[*].name is required because it's a merge key
+		# Update a container's image; spec.containers[*].name is required because it's a merge key.
 		kubectl patch pod valid-pod -p '{"spec":{"containers":[{"name":"kubernetes-serve-hostname","image":"new image"}]}}'
 
-		# Update a container's image using a json patch with positional arrays
+		# Update a container's image using a json patch with positional arrays.
 		kubectl patch pod valid-pod --type='json' -p='[{"op": "replace", "path": "/spec/containers/0/image", "value":"new image"}]'`))
 )
 
 func NewCmdPatch(f cmdutil.Factory, out io.Writer) *cobra.Command {
 	options := &PatchOptions{}
-
-	// retrieve a list of handled resources from printer as valid args
-	validArgs, argAliases := []string{}, []string{}
-	p, err := f.Printer(nil, printers.PrintOptions{
-		ColumnLabels: []string{},
-	})
-	cmdutil.CheckErr(err)
-	if p != nil {
-		validArgs = p.HandledResources()
-		argAliases = kubectl.ResourceAliases(validArgs)
-	}
+	validArgs := cmdutil.ValidArgList(f)
 
 	cmd := &cobra.Command{
-		Use:     "patch (-f FILENAME | TYPE NAME) -p PATCH",
+		Use: "patch (-f FILENAME | TYPE NAME) -p PATCH",
+		DisableFlagsInUseLine: true,
 		Short:   i18n.T("Update field(s) of a resource using strategic merge patch"),
 		Long:    patchLong,
 		Example: patchExample,
 		Run: func(cmd *cobra.Command, args []string) {
 			options.OutputFormat = cmdutil.GetFlagString(cmd, "output")
+			options.DryRun = cmdutil.GetFlagBool(cmd, "dry-run")
 			err := RunPatch(f, out, cmd, args, options)
 			cmdutil.CheckErr(err)
 		},
 		ValidArgs:  validArgs,
-		ArgAliases: argAliases,
+		ArgAliases: kubectl.ResourceAliases(validArgs),
 	}
 	cmd.Flags().StringP("patch", "p", "", "The patch to be applied to the resource JSON file.")
 	cmd.MarkFlagRequired("patch")
 	cmd.Flags().String("type", "strategic", fmt.Sprintf("The type of patch being provided; one of %v", sets.StringKeySet(patchTypes).List()))
 	cmdutil.AddPrinterFlags(cmd)
 	cmdutil.AddRecordFlag(cmd)
+	cmdutil.AddDryRunFlag(cmd)
 	cmdutil.AddInclude3rdPartyFlags(cmd)
 
 	usage := "identifying the resource to update"
 	cmdutil.AddFilenameOptionFlags(cmd, &options.FilenameOptions, usage)
 
-	cmd.Flags().BoolVar(&options.Local, "local", false, "If true, patch will operate on the content of the file, not the server-side resource.")
+	cmd.Flags().BoolVar(&options.Local, "local", options.Local, "If true, patch will operate on the content of the file, not the server-side resource.")
 
 	return cmd
 }
@@ -150,14 +145,8 @@ func RunPatch(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []strin
 		return fmt.Errorf("unable to parse %q: %v", patch, err)
 	}
 
-	// TODO: fix --local to work with customresources without making use of the discovery client.
-	// https://github.com/kubernetes/kubernetes/issues/46722
-	builder, err := f.NewUnstructuredBuilder(true)
-	if err != nil {
-		return err
-	}
-
-	r := builder.
+	r := f.NewBuilder().
+		Unstructured().
 		ContinueOnError().
 		NamespaceParam(cmdNamespace).DefaultNamespace().
 		FilenameParam(enforceNamespace, &options.FilenameOptions).
@@ -181,8 +170,7 @@ func RunPatch(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []strin
 			return err
 		}
 
-		if !options.Local {
-			dataChangedMsg := "not patched"
+		if !options.Local && !options.DryRun {
 			helper := resource.NewHelper(client, mapping)
 			patchedObj, err := helper.Patch(namespace, name, patchType, patchBytes)
 			if err != nil {
@@ -193,7 +181,6 @@ func RunPatch(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []strin
 				// Copy the resource info and update with the result of applying the user's patch
 				infoCopy := *info
 				infoCopy.Object = patchedObj
-				infoCopy.VersionedObject = patchedObj
 				if patch, patchType, err := cmdutil.ChangeResourcePatch(&infoCopy, f.Command(cmd, true)); err == nil {
 					if recordedObj, err := helper.Patch(info.Namespace, info.Name, patchType, patch); err != nil {
 						glog.V(4).Infof("error recording reason: %v", err)
@@ -204,17 +191,7 @@ func RunPatch(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []strin
 			}
 			count++
 
-			oldData, err := json.Marshal(info.Object)
-			if err != nil {
-				return err
-			}
-			newData, err := json.Marshal(patchedObj)
-			if err != nil {
-				return err
-			}
-			if !reflect.DeepEqual(oldData, newData) {
-				dataChangedMsg = "patched"
-			}
+			didPatch := !reflect.DeepEqual(info.Object, patchedObj)
 
 			// After computing whether we changed data, refresh the resource info with the resulting object
 			if err := info.Refresh(patchedObj, true); err != nil {
@@ -222,24 +199,26 @@ func RunPatch(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []strin
 			}
 
 			if len(options.OutputFormat) > 0 && options.OutputFormat != "name" {
-				return cmdutil.PrintResourceInfoForCommand(cmd, info, f, out)
+				return cmdutil.PrintObject(cmd, info.Object, out)
 			}
-			mapper, _, err := f.UnstructuredObject()
-			if err != nil {
-				return err
+			cmdutil.PrintSuccess(options.OutputFormat == "name", out, info.Object, false, patchOperation(didPatch))
+
+			// if object was not successfully patched, exit with error code 1
+			if !didPatch {
+				return cmdutil.ErrExit
 			}
-			cmdutil.PrintSuccess(mapper, options.OutputFormat == "name", out, info.Mapping.Resource, info.Name, false, dataChangedMsg)
+
 			return nil
 		}
 
 		count++
 
-		originalObjJS, err := runtime.Encode(unstructured.UnstructuredJSONScheme, info.VersionedObject)
+		originalObjJS, err := runtime.Encode(unstructured.UnstructuredJSONScheme, info.Object)
 		if err != nil {
 			return err
 		}
 
-		originalPatchedObjJS, err := getPatchedJSON(patchType, originalObjJS, patchBytes, mapping.GroupVersionKind, api.Scheme)
+		originalPatchedObjJS, err := getPatchedJSON(patchType, originalObjJS, patchBytes, mapping.GroupVersionKind, scheme.Scheme)
 		if err != nil {
 			return err
 		}
@@ -249,14 +228,24 @@ func RunPatch(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []strin
 			return err
 		}
 
+		didPatch := !reflect.DeepEqual(info.Object, targetObj)
+
 		// TODO: if we ever want to go generic, this allows a clean -o yaml without trying to print columns or anything
 		// rawExtension := &runtime.Unknown{
 		//	Raw: originalPatchedObjJS,
 		// }
-		if err := info.Refresh(targetObj, true); err != nil {
-			return err
+		if didPatch {
+			if err := info.Refresh(targetObj, true); err != nil {
+				return err
+			}
 		}
-		return cmdutil.PrintResourceInfoForCommand(cmd, info, f, out)
+
+		if len(options.OutputFormat) > 0 && options.OutputFormat != "name" {
+			return cmdutil.PrintObject(cmd, info.Object, out)
+		}
+
+		cmdutil.PrintSuccess(options.OutputFormat == "name", out, info.Object, options.DryRun, patchOperation(didPatch))
+		return nil
 	})
 	if err != nil {
 		return err
@@ -291,4 +280,11 @@ func getPatchedJSON(patchType types.PatchType, originalJS, patchJS []byte, gvk s
 		// only here as a safety net - go-restful filters content-type
 		return nil, fmt.Errorf("unknown Content-Type header for patch: %v", patchType)
 	}
+}
+
+func patchOperation(didPatch bool) string {
+	if didPatch {
+		return "patched"
+	}
+	return "not patched"
 }
