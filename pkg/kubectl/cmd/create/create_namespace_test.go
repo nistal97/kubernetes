@@ -17,14 +17,13 @@ limitations under the License.
 package create
 
 import (
-	"bytes"
 	"net/http"
 	"testing"
 
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/rest/fake"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	cmdtesting "k8s.io/kubernetes/pkg/kubectl/cmd/testing"
 	"k8s.io/kubernetes/pkg/kubectl/scheme"
 )
@@ -35,8 +34,8 @@ func TestCreateNamespace(t *testing.T) {
 	tf := cmdtesting.NewTestFactory()
 	defer tf.Cleanup()
 
-	codec := legacyscheme.Codecs.LegacyCodec(scheme.Versions...)
-	ns := legacyscheme.Codecs
+	codec := scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
+	ns := scheme.Codecs
 
 	tf.Client = &fake.RESTClient{
 		GroupVersion:         schema.GroupVersion{Version: "v1"},
@@ -51,8 +50,8 @@ func TestCreateNamespace(t *testing.T) {
 			}
 		}),
 	}
-	buf := bytes.NewBuffer([]byte{})
-	cmd := NewCmdCreateNamespace(tf, buf)
+	ioStreams, _, buf, _ := genericclioptions.NewTestIOStreams()
+	cmd := NewCmdCreateNamespace(tf, ioStreams)
 	cmd.Flags().Set("output", "name")
 	cmd.Run(cmd, []string{namespaceObject.Name})
 	expectedOutput := "namespace/" + namespaceObject.Name + "\n"

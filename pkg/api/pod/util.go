@@ -58,6 +58,10 @@ func VisitPodSecretNames(pod *api.Pod, visitor Visitor) bool {
 			if source.CephFS.SecretRef != nil && !visitor(source.CephFS.SecretRef.Name) {
 				return false
 			}
+		case source.Cinder != nil:
+			if source.Cinder.SecretRef != nil && !visitor(source.Cinder.SecretRef.Name) {
+				return false
+			}
 		case source.FlexVolume != nil:
 			if source.FlexVolume.SecretRef != nil && !visitor(source.FlexVolume.SecretRef.Name) {
 				return false
@@ -244,10 +248,6 @@ func DropDisabledAlphaFields(podSpec *api.PodSpec) {
 		}
 	}
 
-	if !utilfeature.DefaultFeatureGate.Enabled(features.PodShareProcessNamespace) && podSpec.SecurityContext != nil {
-		podSpec.SecurityContext.ShareProcessNamespace = nil
-	}
-
 	for i := range podSpec.Containers {
 		DropDisabledVolumeMountsAlphaFields(podSpec.Containers[i].VolumeMounts)
 	}
@@ -258,6 +258,10 @@ func DropDisabledAlphaFields(podSpec *api.PodSpec) {
 	DropDisabledVolumeDevicesAlphaFields(podSpec)
 
 	DropDisabledRunAsGroupField(podSpec)
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClass) && podSpec.RuntimeClassName != nil {
+		podSpec.RuntimeClassName = nil
+	}
 }
 
 // DropDisabledRunAsGroupField removes disabled fields from PodSpec related

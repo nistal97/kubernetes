@@ -24,12 +24,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/kubectl"
 	cmdtesting "k8s.io/kubernetes/pkg/kubectl/cmd/testing"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/kubectl/scheme"
 )
 
 func Test_generatorFromName(t *testing.T) {
@@ -88,10 +89,10 @@ func Test_generatorFromName(t *testing.T) {
 
 func TestCreateDeployment(t *testing.T) {
 	depName := "jonny-dep"
-	tf := cmdtesting.NewTestFactory()
+	tf := cmdtesting.NewTestFactory().WithNamespace("test")
 	defer tf.Cleanup()
 
-	ns := legacyscheme.Codecs
+	ns := scheme.Codecs
 	fakeDiscovery := "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"apps/v1\",\"resources\":[{\"name\":\"deployments\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Deployment\",\"verbs\":[\"create\",\"delete\",\"deletecollection\",\"get\",\"list\",\"patch\",\"update\",\"watch\"],\"shortNames\":[\"deploy\"],\"categories\":[\"all\"]}]}"
 	tf.Client = &fake.RESTClient{
 		NegotiatedSerializer: ns,
@@ -103,10 +104,9 @@ func TestCreateDeployment(t *testing.T) {
 		}),
 	}
 	tf.ClientConfigVal = &restclient.Config{}
-	tf.Namespace = "test"
-	buf := bytes.NewBuffer([]byte{})
 
-	cmd := NewCmdCreateDeployment(tf, buf, buf)
+	ioStreams, _, buf, _ := genericclioptions.NewTestIOStreams()
+	cmd := NewCmdCreateDeployment(tf, ioStreams)
 	cmd.Flags().Set("dry-run", "true")
 	cmd.Flags().Set("output", "name")
 	cmd.Flags().Set("image", "hollywood/jonny.depp:v2")
@@ -119,10 +119,10 @@ func TestCreateDeployment(t *testing.T) {
 
 func TestCreateDeploymentNoImage(t *testing.T) {
 	depName := "jonny-dep"
-	tf := cmdtesting.NewTestFactory()
+	tf := cmdtesting.NewTestFactory().WithNamespace("test")
 	defer tf.Cleanup()
 
-	ns := legacyscheme.Codecs
+	ns := scheme.Codecs
 	fakeDiscovery := "{\"kind\":\"APIResourceList\",\"apiVersion\":\"v1\",\"groupVersion\":\"apps/v1\",\"resources\":[{\"name\":\"deployments\",\"singularName\":\"\",\"namespaced\":true,\"kind\":\"Deployment\",\"verbs\":[\"create\",\"delete\",\"deletecollection\",\"get\",\"list\",\"patch\",\"update\",\"watch\"],\"shortNames\":[\"deploy\"],\"categories\":[\"all\"]}]}"
 	tf.Client = &fake.RESTClient{
 		NegotiatedSerializer: ns,
@@ -134,18 +134,15 @@ func TestCreateDeploymentNoImage(t *testing.T) {
 		}),
 	}
 	tf.ClientConfigVal = &restclient.Config{}
-	tf.Namespace = "test"
 
-	buf := bytes.NewBuffer([]byte{})
-	errBuff := bytes.NewBuffer([]byte{})
-	cmd := NewCmdCreateDeployment(tf, buf, errBuff)
+	ioStreams := genericclioptions.NewTestIOStreamsDiscard()
+	cmd := NewCmdCreateDeployment(tf, ioStreams)
 	cmd.Flags().Set("output", "name")
 	options := &DeploymentOpts{
 		CreateSubcommandOptions: &CreateSubcommandOptions{
-			PrintFlags: NewPrintFlags("created"),
-			CmdOut:     buf,
-			CmdErr:     errBuff,
+			PrintFlags: genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme),
 			DryRun:     true,
+			IOStreams:  ioStreams,
 		},
 	}
 
@@ -154,6 +151,6 @@ func TestCreateDeploymentNoImage(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	err = options.Run(tf)
+	err = options.Run()
 	assert.Error(t, err, "at least one image must be specified")
 }

@@ -21,10 +21,13 @@ limitations under the License.
 package gce
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,8 +36,8 @@ import (
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	v1_service "k8s.io/kubernetes/pkg/api/v1/service"
-	"k8s.io/kubernetes/pkg/cloudprovider"
 	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud"
 	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud/meta"
 	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud/mock"
@@ -52,20 +55,22 @@ const (
 )
 
 type TestClusterValues struct {
-	ProjectID   string
-	Region      string
-	ZoneName    string
-	ClusterID   string
-	ClusterName string
+	ProjectID         string
+	Region            string
+	ZoneName          string
+	SecondaryZoneName string
+	ClusterID         string
+	ClusterName       string
 }
 
 func DefaultTestClusterValues() TestClusterValues {
 	return TestClusterValues{
-		ProjectID:   "test-project",
-		Region:      "us-central1",
-		ZoneName:    "us-central1-b",
-		ClusterID:   "test-cluster-id",
-		ClusterName: "Test Cluster Name",
+		ProjectID:         "test-project",
+		Region:            "us-central1",
+		ZoneName:          "us-central1-b",
+		SecondaryZoneName: "us-central1-c",
+		ClusterID:         "test-cluster-id",
+		ClusterName:       "Test Cluster Name",
 	}
 }
 
@@ -82,6 +87,10 @@ func fakeLoadbalancerService(lbType string) *v1.Service {
 		},
 	}
 }
+
+var (
+	FilewallChangeMsg = fmt.Sprintf("%s %s %s", v1.EventTypeNormal, eventReasonManualChange, eventMsgFirewallChange)
+)
 
 type fakeRoundTripper struct{}
 
@@ -125,6 +134,8 @@ func fakeGCECloud(vals TestClusterValues) (*GCECloud, error) {
 	c.MockForwardingRules.InsertHook = mock.InsertFwdRuleHook
 	c.MockAddresses.InsertHook = mock.InsertAddressHook
 	c.MockAlphaAddresses.InsertHook = mock.InsertAlphaAddressHook
+	c.MockAlphaAddresses.X = mock.AddressAttributes{}
+	c.MockAddresses.X = mock.AddressAttributes{}
 
 	c.MockInstanceGroups.X = mock.InstanceGroupAttributes{
 		InstanceMap: make(map[meta.Key]map[string]*compute.InstanceWithNamedPorts),
@@ -209,7 +220,7 @@ func fakeClusterID(clusterID string) ClusterID {
 }
 
 func assertExternalLbResources(t *testing.T, gce *GCECloud, apiService *v1.Service, vals TestClusterValues, nodeNames []string) {
-	lbName := cloudprovider.GetLoadBalancerName(apiService)
+	lbName := gce.GetLoadBalancerName(context.TODO(), "", apiService)
 	hcName := MakeNodesHealthCheckName(vals.ClusterID)
 
 	// Check that Firewalls are created for the LoadBalancer and the HealthCheck
@@ -246,7 +257,7 @@ func assertExternalLbResources(t *testing.T, gce *GCECloud, apiService *v1.Servi
 }
 
 func assertExternalLbResourcesDeleted(t *testing.T, gce *GCECloud, apiService *v1.Service, vals TestClusterValues, firewallsDeleted bool) {
-	lbName := cloudprovider.GetLoadBalancerName(apiService)
+	lbName := gce.GetLoadBalancerName(context.TODO(), "", apiService)
 	hcName := MakeNodesHealthCheckName(vals.ClusterID)
 
 	if firewallsDeleted {
@@ -281,7 +292,7 @@ func assertExternalLbResourcesDeleted(t *testing.T, gce *GCECloud, apiService *v
 }
 
 func assertInternalLbResources(t *testing.T, gce *GCECloud, apiService *v1.Service, vals TestClusterValues, nodeNames []string) {
-	lbName := cloudprovider.GetLoadBalancerName(apiService)
+	lbName := gce.GetLoadBalancerName(context.TODO(), "", apiService)
 
 	// Check that Instance Group is created
 	igName := makeInstanceGroupName(vals.ClusterID)
@@ -334,7 +345,7 @@ func assertInternalLbResources(t *testing.T, gce *GCECloud, apiService *v1.Servi
 }
 
 func assertInternalLbResourcesDeleted(t *testing.T, gce *GCECloud, apiService *v1.Service, vals TestClusterValues, firewallsDeleted bool) {
-	lbName := cloudprovider.GetLoadBalancerName(apiService)
+	lbName := gce.GetLoadBalancerName(context.TODO(), "", apiService)
 	sharedHealthCheck := !v1_service.RequestsOnlyLocalTraffic(apiService)
 	hcName := makeHealthCheckName(lbName, vals.ClusterID, sharedHealthCheck)
 
@@ -369,4 +380,24 @@ func assertInternalLbResourcesDeleted(t *testing.T, gce *GCECloud, apiService *v
 	healthcheck, err := gce.GetHealthCheck(hcName)
 	require.Error(t, err)
 	assert.Nil(t, healthcheck)
+}
+
+func checkEvent(t *testing.T, recorder *record.FakeRecorder, expected string, shouldMatch bool) bool {
+	select {
+	case received := <-recorder.Events:
+		if strings.HasPrefix(received, expected) != shouldMatch {
+			t.Errorf(received)
+			if shouldMatch {
+				t.Errorf("Should receive message \"%v\" but got \"%v\".", expected, received)
+			} else {
+				t.Errorf("Unexpected event \"%v\".", received)
+			}
+		}
+		return false
+	case <-time.After(2 * time.Second):
+		if shouldMatch {
+			t.Errorf("Should receive message \"%v\" but got timed out.", expected)
+		}
+		return true
+	}
 }

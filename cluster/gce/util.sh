@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2017 The Kubernetes Authors.
 #
@@ -109,6 +109,20 @@ function split_csv() {
 # Verify prereqs
 function verify-prereqs() {
   local cmd
+
+  # we use openssl to generate certs
+  kube::util::test_openssl_installed
+
+  # ensure a version supported by easyrsa is installed
+  if [ "$(openssl version | cut -d\  -f1)" == "LibreSSL" ]; then
+    echo "LibreSSL is not supported. Please ensure openssl points to an OpenSSL binary"
+    if [ "$(uname -s)" == "Darwin" ]; then
+      echo 'On macOS we recommend using homebrew and adding "$(brew --prefix openssl)/bin" to your PATH'
+    fi
+    exit 1
+  fi
+
+  # we use gcloud to create the cluster, gsutil to stage binaries and data
   for cmd in gcloud gsutil; do
     if ! which "${cmd}" >/dev/null; then
       local resp="n"
@@ -621,6 +635,9 @@ function construct-kubelet-flags {
   flags+=" --experimental-check-node-capabilities-before-mount=true"
   # Keep in sync with the mkdir command in configure-helper.sh (until the TODO is resolved)
   flags+=" --cert-dir=/var/lib/kubelet/pki/"
+  # Configure the directory that the Kubelet should use to store dynamic config checkpoints
+  flags+=" --dynamic-config-dir=/var/lib/kubelet/dynamic-config"
+
 
   if [[ "${master}" == "true" ]]; then
     flags+=" ${MASTER_KUBELET_TEST_ARGS:-}"
@@ -639,7 +656,7 @@ function construct-kubelet-flags {
   # Network plugin
   if [[ -n "${NETWORK_PROVIDER:-}" || -n "${NETWORK_POLICY_PROVIDER:-}" ]]; then
     flags+=" --cni-bin-dir=/home/kubernetes/bin"
-    if [[ "${NETWORK_POLICY_PROVIDER:-}" == "calico" ]]; then
+    if [[ "${NETWORK_POLICY_PROVIDER:-}" == "calico" || "${ENABLE_NETD:-}" == "true" ]]; then
       # Calico uses CNI always.
       # Note that network policy won't work for master node.
       if [[ "${master}" == "true" ]]; then
@@ -650,15 +667,13 @@ function construct-kubelet-flags {
     else
       # Otherwise use the configured value.
       flags+=" --network-plugin=${NETWORK_PROVIDER}"
+
     fi
   fi
   if [[ -n "${NON_MASQUERADE_CIDR:-}" ]]; then
     flags+=" --non-masquerade-cidr=${NON_MASQUERADE_CIDR}"
   fi
   flags+=" --volume-plugin-dir=${VOLUME_PLUGIN_DIR}"
-  if [[ -n "${ENABLE_CUSTOM_METRICS:-}" ]]; then
-    flags+=" --enable-custom-metrics=${ENABLE_CUSTOM_METRICS}"
-  fi
   local node_labels=$(build-node-labels ${master})
   if [[ -n "${node_labels:-}" ]]; then
     flags+=" --node-labels=${node_labels}"
@@ -673,9 +688,11 @@ function construct-kubelet-flags {
   if [[ -n "${CONTAINER_RUNTIME:-}" ]]; then
     flags+=" --container-runtime=${CONTAINER_RUNTIME}"
   fi
-  # TODO(mtaufen): CONTAINER_RUNTIME_ENDPOINT seems unused; delete it?
   if [[ -n "${CONTAINER_RUNTIME_ENDPOINT:-}" ]]; then
     flags+=" --container-runtime-endpoint=${CONTAINER_RUNTIME_ENDPOINT}"
+  fi
+  if [[ -n "${MAX_PODS_PER_NODE:-}" ]]; then
+    flags+=" --max-pods=${MAX_PODS_PER_NODE}"
   fi
 
   KUBELET_ARGS="${flags}"
@@ -812,9 +829,9 @@ SERVICE_CLUSTER_IP_RANGE: $(yaml-quote ${SERVICE_CLUSTER_IP_RANGE})
 KUBERNETES_MASTER_NAME: $(yaml-quote ${KUBERNETES_MASTER_NAME})
 ALLOCATE_NODE_CIDRS: $(yaml-quote ${ALLOCATE_NODE_CIDRS:-false})
 ENABLE_CLUSTER_MONITORING: $(yaml-quote ${ENABLE_CLUSTER_MONITORING:-none})
+ENABLE_PROMETHEUS_MONITORING: $(yaml-quote ${ENABLE_PROMETHEUS_MONITORING:-false})
 ENABLE_METRICS_SERVER: $(yaml-quote ${ENABLE_METRICS_SERVER:-false})
 ENABLE_METADATA_AGENT: $(yaml-quote ${ENABLE_METADATA_AGENT:-none})
-METADATA_AGENT_VERSION: $(yaml-quote ${METADATA_AGENT_VERSION:-})
 METADATA_AGENT_CPU_REQUEST: $(yaml-quote ${METADATA_AGENT_CPU_REQUEST:-})
 METADATA_AGENT_MEMORY_REQUEST: $(yaml-quote ${METADATA_AGENT_MEMORY_REQUEST:-})
 METADATA_AGENT_CLUSTER_LEVEL_CPU_REQUEST: $(yaml-quote ${METADATA_AGENT_CLUSTER_LEVEL_CPU_REQUEST:-})
@@ -827,7 +844,6 @@ ENABLE_NODE_PROBLEM_DETECTOR: $(yaml-quote ${ENABLE_NODE_PROBLEM_DETECTOR:-none}
 NODE_PROBLEM_DETECTOR_VERSION: $(yaml-quote ${NODE_PROBLEM_DETECTOR_VERSION:-})
 NODE_PROBLEM_DETECTOR_TAR_HASH: $(yaml-quote ${NODE_PROBLEM_DETECTOR_TAR_HASH:-})
 ENABLE_NODE_LOGGING: $(yaml-quote ${ENABLE_NODE_LOGGING:-false})
-ENABLE_RESCHEDULER: $(yaml-quote ${ENABLE_RESCHEDULER:-false})
 LOGGING_DESTINATION: $(yaml-quote ${LOGGING_DESTINATION:-})
 ELASTICSEARCH_LOGGING_REPLICAS: $(yaml-quote ${ELASTICSEARCH_LOGGING_REPLICAS:-})
 ENABLE_CLUSTER_DNS: $(yaml-quote ${ENABLE_CLUSTER_DNS:-false})
@@ -862,6 +878,7 @@ ENABLE_CACHE_MUTATION_DETECTOR: $(yaml-quote ${ENABLE_CACHE_MUTATION_DETECTOR:-f
 ENABLE_PATCH_CONVERSION_DETECTOR: $(yaml-quote ${ENABLE_PATCH_CONVERSION_DETECTOR:-false})
 ADVANCED_AUDIT_POLICY: $(yaml-quote ${ADVANCED_AUDIT_POLICY:-})
 ADVANCED_AUDIT_BACKEND: $(yaml-quote ${ADVANCED_AUDIT_BACKEND:-log})
+ADVANCED_AUDIT_TRUNCATING_BACKEND: $(yaml-quote ${ADVANCED_AUDIT_TRUNCATING_BACKEND:-})
 ADVANCED_AUDIT_LOG_MODE: $(yaml-quote ${ADVANCED_AUDIT_LOG_MODE:-})
 ADVANCED_AUDIT_LOG_BUFFER_SIZE: $(yaml-quote ${ADVANCED_AUDIT_LOG_BUFFER_SIZE:-})
 ADVANCED_AUDIT_LOG_MAX_BATCH_SIZE: $(yaml-quote ${ADVANCED_AUDIT_LOG_MAX_BATCH_SIZE:-})
@@ -889,9 +906,17 @@ CONTAINER_RUNTIME_NAME: $(yaml-quote ${CONTAINER_RUNTIME_NAME:-})
 NODE_LOCAL_SSDS_EXT: $(yaml-quote ${NODE_LOCAL_SSDS_EXT:-})
 LOAD_IMAGE_COMMAND: $(yaml-quote ${LOAD_IMAGE_COMMAND:-})
 ZONE: $(yaml-quote ${ZONE})
+REGION: $(yaml-quote ${REGION})
 VOLUME_PLUGIN_DIR: $(yaml-quote ${VOLUME_PLUGIN_DIR})
 KUBELET_ARGS: $(yaml-quote ${KUBELET_ARGS})
 REQUIRE_METADATA_KUBELET_CONFIG_FILE: $(yaml-quote true)
+ENABLE_NETD: $(yaml-quote ${ENABLE_NETD:-false})
+CUSTOM_NETD_YAML: |
+$(echo "${CUSTOM_NETD_YAML:-}" | sed -e "s/'/''/g")
+CUSTOM_CALICO_NODE_DAEMONSET_YAML: |
+$(echo "${CUSTOM_CALICO_NODE_DAEMONSET_YAML:-}" | sed -e "s/'/''/g")
+CUSTOM_TYPHA_DEPLOYMENT_YAML: |
+$(echo "${CUSTOM_TYPHA_DEPLOYMENT_YAML:-}" | sed -e "s/'/''/g")
 EOF
   if [[ "${master}" == "true" && "${MASTER_OS_DISTRIBUTION}" == "gci" ]] || \
      [[ "${master}" == "false" && "${NODE_OS_DISTRIBUTION}" == "gci" ]]  || \
@@ -1042,6 +1067,11 @@ EOF
 ETCD_QUOTA_BACKEND_BYTES: $(yaml-quote ${ETCD_QUOTA_BACKEND_BYTES})
 EOF
     fi
+    if [ -n "${ETCD_EXTRA_ARGS:-}" ]; then
+    cat >>$file <<EOF
+ETCD_EXTRA_ARGS: $(yaml-quote ${ETCD_EXTRA_ARGS})
+EOF
+    fi
     if [ -n "${APISERVER_TEST_ARGS:-}" ]; then
       cat >>$file <<EOF
 APISERVER_TEST_ARGS: $(yaml-quote ${APISERVER_TEST_ARGS})
@@ -1075,11 +1105,6 @@ EOF
     if [ -n "${INITIAL_ETCD_CLUSTER_STATE:-}" ]; then
       cat >>$file <<EOF
 INITIAL_ETCD_CLUSTER_STATE: $(yaml-quote ${INITIAL_ETCD_CLUSTER_STATE})
-EOF
-    fi
-    if [ -n "${ETCD_QUORUM_READ:-}" ]; then
-      cat >>$file <<EOF
-ETCD_QUORUM_READ: $(yaml-quote ${ETCD_QUORUM_READ})
 EOF
     fi
     if [ -n "${CLUSTER_SIGNING_DURATION:-}" ]; then
@@ -1136,6 +1161,11 @@ EOF
   if [ -n "${SCHEDULING_ALGORITHM_PROVIDER:-}" ]; then
     cat >>$file <<EOF
 SCHEDULING_ALGORITHM_PROVIDER: $(yaml-quote ${SCHEDULING_ALGORITHM_PROVIDER})
+EOF
+  fi
+  if [ -n "${MAX_PODS_PER_NODE:-}" ]; then
+    cat >>$file <<EOF
+MAX_PODS_PER_NODE: $(yaml-quote ${MAX_PODS_PER_NODE})
 EOF
   fi
 }
@@ -2299,6 +2329,8 @@ function create-nodes() {
   if [[ -z "${HEAPSTER_MACHINE_TYPE:-}" ]]; then
     local -r nodes="${NUM_NODES}"
   else
+    echo "Creating a special node for heapster with machine-type ${HEAPSTER_MACHINE_TYPE}"
+    create-heapster-node
     local -r nodes=$(( NUM_NODES - 1 ))
   fi
 
@@ -2328,11 +2360,6 @@ function create-nodes() {
         --zone "${ZONE}" \
         --project "${PROJECT}" || true;
   done
-
-  if [[ -n "${HEAPSTER_MACHINE_TYPE:-}" ]]; then
-    echo "Creating a special node for heapster with machine-type ${HEAPSTER_MACHINE_TYPE}"
-    create-heapster-node
-  fi
 }
 
 # Assumes:
